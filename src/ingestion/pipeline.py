@@ -8,6 +8,7 @@ from src.ingestion.yaml_loader import KubernetesYAMLLoader
 from src.ingestion.log_loader import KubernetesLogLoader
 from src.ingestion.events_loader import KubernetesEventsLoader
 from src.ingestion.markdown_loader import MarkdownDocumentLoader
+from src.ingestion.helm_loader import HelmChartLoader
 
 logger = logging.getLogger(__name__)
 
@@ -79,15 +80,31 @@ class IngestionPipeline:
         """Detect document type from path."""
         if path.is_file():
             suffix = path.suffix.lower()
-            if suffix in [".yaml", ".yml"]:
+            name_lower = path.name.lower()
+            if "events" in name_lower:
+                return "event"
+            elif suffix in [".yaml", ".yml"]:
                 return "yaml"
-            elif suffix == ".log":
+            elif suffix in [".log", ".txt"]:
                 return "log"
             elif suffix == ".md":
                 return "markdown"
-            elif "events" in path.name.lower():
-                return "event"
+            elif suffix == ".tpl":
+                return "helm"
         elif path.is_dir():
+            # Check for Helm chart structure
+            if (path / "Chart.yaml").exists() or (path / "Chart.yml").exists():
+                return "helm"
+            # Check directory name hints
+            dir_name = path.name.lower()
+            if dir_name in ("events", "event"):
+                return "event"
+            elif dir_name in ("logs", "log"):
+                return "log"
+            elif dir_name in ("manifests", "manifest", "k8s", "kubernetes"):
+                return "yaml"
+            elif dir_name in ("docs", "documentation", "runbooks"):
+                return "markdown"
             # Check subdirectories
             if (path / "manifests").exists():
                 return "yaml"
@@ -95,6 +112,8 @@ class IngestionPipeline:
                 return "log"
             elif (path / "events").exists():
                 return "event"
+            elif (path / "templates").exists():
+                return "helm"
         
         # Default
         return "yaml"
@@ -106,6 +125,7 @@ class IngestionPipeline:
             "log": KubernetesLogLoader,
             "event": KubernetesEventsLoader,
             "markdown": MarkdownDocumentLoader,
+            "helm": HelmChartLoader,
         }
         
         loader_class = loaders.get(doc_type, KubernetesYAMLLoader)

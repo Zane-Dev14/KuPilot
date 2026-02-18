@@ -47,8 +47,26 @@ settings = get_settings()
 
 @app.get("/health")
 async def health():
-    """Health check endpoint."""
-    return {"status": "ok"}
+    """Health check — reports status of all backend components."""
+    from src.vectorstore.milvus_client import MilvusVectorStore
+
+    components: dict[str, str] = {
+        "api": "ok",
+        "rag_chain": "ok" if rag_chain is not None else "not_initialized",
+        "query_analyzer": "ok" if query_analyzer is not None else "not_initialized",
+        "ingestion_pipeline": "ok" if ingestion_pipeline is not None else "not_initialized",
+    }
+
+    # Check Milvus connectivity
+    try:
+        vs = MilvusVectorStore()
+        milvus_ok = vs.health_check()
+        components["milvus"] = "ok" if milvus_ok else "unreachable"
+    except Exception:
+        components["milvus"] = "unreachable"
+
+    overall = "ok" if all(v == "ok" for v in components.values()) else "degraded"
+    return {"status": overall, "components": components}
 
 @app.post("/diagnose", response_model=DiagnoseResponse)
 async def diagnose(request: DiagnoseRequest):
