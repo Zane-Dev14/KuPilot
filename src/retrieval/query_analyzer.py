@@ -1,19 +1,10 @@
 import logging
 import re
-from dataclasses import dataclass, field
-from typing import Optional
+
+from src.models.schemas import QueryMetadata
 
 logger = logging.getLogger(__name__)
 
-@dataclass
-class QueryMetadata:
-    """Extracted Kubernetes metadata from a query."""
-    namespace: Optional[str] = None
-    pod: Optional[str] = None
-    container: Optional[str] = None
-    node: Optional[str] = None
-    error_type: Optional[str] = None
-    labels_dict: dict[str, str] = field(default_factory=dict)
 
 class QueryAnalyzer:
     """Analyze queries to extract K8s metadata and decompose multi-part questions."""

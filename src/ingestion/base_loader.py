@@ -1,6 +1,6 @@
 import logging
 from abc import ABC, abstractmethod
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from langchain_core.documents import Document
 
@@ -33,7 +33,7 @@ class BaseDocumentLoader(ABC):
         
         # Add metadata to all chunks
         for i, doc in enumerate(chunked):
-            doc.metadata.setdefault("ingested_at", datetime.utcnow().isoformat())
+            doc.metadata.setdefault("ingested_at", datetime.now(timezone.utc).isoformat())
             doc.metadata.setdefault("chunk_index", i)
         
         return chunked

@@ -1,4 +1,5 @@
 import logging
+from typing import Optional
 from sentence_transformers import CrossEncoder
 from langchain_core.documents import Document
 from src.config import get_settings
@@ -8,8 +9,8 @@ logger = logging.getLogger(__name__)
 class RerankerService:
     """Cross-encoder reranker using bge-reranker-v2-m3."""
     
-    _instance = None
-    _model = None
+    _instance: Optional["RerankerService"] = None
+    _model: Optional[CrossEncoder] = None
     
     def __new__(cls):
         if cls._instance is None:
@@ -17,7 +18,7 @@ class RerankerService:
         return cls._instance
     
     def __init__(self):
-        if self._model is None:
+        if RerankerService._model is None:
             self._load_model()
     
     def _load_model(self) -> None:
@@ -25,8 +26,14 @@ class RerankerService:
         settings = get_settings()
         logger.info(f"Loading reranker model: {settings.reranker_model}")
         
-        self._model = CrossEncoder(settings.reranker_model)
+        RerankerService._model = CrossEncoder(settings.reranker_model)
         logger.info("Reranker model loaded successfully")
+    
+    def _get_model(self) -> CrossEncoder:
+        """Get the loaded model, raising if not initialized."""
+        if self._model is None:
+            raise RuntimeError("RerankerService model not loaded")
+        return self._model
     
     def rerank(
         self,
@@ -48,13 +55,14 @@ class RerankerService:
         if not documents:
             return []
         
+        model = self._get_model()
         logger.debug(f"Reranking {len(documents)} documents for query: {query[:100]}...")
         
         # Prepare document texts
         doc_texts = [doc.page_content for doc in documents]
         
         # Score document-query pairs
-        scores = self._model.predict([[query, doc] for doc in doc_texts])
+        scores = model.predict([[query, doc] for doc in doc_texts])
         
         # Sort by score (descending)
         ranked = sorted(zip(documents, scores), key=lambda x: x[1], reverse=True)

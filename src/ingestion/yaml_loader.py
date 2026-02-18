@@ -1,5 +1,6 @@
 import logging
 import yaml
+from itertools import chain
 from pathlib import Path
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -16,7 +17,7 @@ class KubernetesYAMLLoader(BaseDocumentLoader):
         
         if path.is_dir():
             # Load all YAML files in directory
-            for yaml_file in path.glob("**/*.yaml") + path.glob("**/*.yml"):
+            for yaml_file in chain(path.glob("**/*.yaml"), path.glob("**/*.yml")):
                 documents.extend(self._load_single_file(yaml_file))
         else:
             documents.extend(self._load_single_file(path))
