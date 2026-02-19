@@ -359,8 +359,11 @@ def _answer_conversational(
     logger.debug("_answer_conversational: have_i_match=%s", bool(m))
     if m:
         topic = m.group(1).strip("?.! ")
+        # Split at first question mark to handle multiple question clauses
+        # e.g., "crashloopback? where, when..." -> "crashloopback"
+        topic = topic.split("?")[0].strip()
         # strip trailing noise words like 'today' or 'where'
-        topic = re.sub(r"\b(today|now|recently|where)\b", "", topic)
+        topic = re.sub(r"\b(today|now|recently|where|when|what|how)\b", "", topic)
         # truncate at trailing conjunction clauses ("and what did you say", "or where", etc.)
         topic = re.split(r"\s+(?:and|or|but|nor)\b", topic)[0]
         # strip any remaining punctuation/whitespace

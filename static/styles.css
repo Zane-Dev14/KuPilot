@@ -948,26 +948,16 @@ body {
 
 /* ── Typing Indicator ───────────────────────────────────────────────── */
 .typing-indicator {
-  display: flex;
+  display: inline-flex;
   align-items: center;
-  gap: 5px;
   padding: 14px 18px;
   align-self: flex-start;
-}
-.typing-indicator .dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: var(--accent-2);
-  box-shadow: 0 0 8px var(--accent-2-glow);
-  animation: typingBounce 1.2s ease-in-out infinite;
-}
-.typing-indicator .dot:nth-child(2) { animation-delay: 0.15s; }
-.typing-indicator .dot:nth-child(3) { animation-delay: 0.3s; }
-
-@keyframes typingBounce {
-  0%, 60%, 100% { transform: translateY(0) scale(1); opacity: 0.4; }
-  30% { transform: translateY(-8px) scale(1.2); opacity: 1; }
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--muted);
+  background: var(--glass);
+  border: 1px solid var(--border);
+  border-radius: 999px;
 }
 
 /* ── Suggestion Pills ───────────────────────────────────────────────── */

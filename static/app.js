@@ -604,20 +604,9 @@ class ChatUI {
     indicator.classList.add('typing-indicator');
     indicator.id = 'typing-indicator';
     indicator.setAttribute('aria-label', 'AI is thinking');
-    for (let i = 0; i < 3; i++) {
-      const dot = document.createElement('div');
-      dot.classList.add('dot');
-      indicator.appendChild(dot);
-    }
+    indicator.textContent = 'Thinking…';
     this.messagesEl.appendChild(indicator);
     this._scrollToBottom();
-
-    if (typeof gsap !== 'undefined') {
-      gsap.fromTo(indicator,
-        { opacity: 0, y: 10, scale: 0.9 },
-        { opacity: 1, y: 0, scale: 1, duration: 0.3, ease: 'power3.out' }
-      );
-    }
     return indicator;
   }
 
@@ -638,6 +627,8 @@ class ChatUI {
     const payload = { question, session_id: sessionId, force_model: forceModel };
 
     let rawText = '';
+    let isJsonStream = false;
+    let hasPlaceholder = false;
     let diagnosis = null;
     let aiMessage = null;
     let bubble = null;
@@ -696,8 +687,21 @@ class ChatUI {
 
             if (event.token) {
               rawText += event.token;
-              bubble.innerHTML = this._renderMarkdown(rawText);
-              this._scrollToBottom();
+              const sample = rawText.trimStart();
+              if (!isJsonStream) {
+                if (sample.startsWith('{') || sample.startsWith('```json') || sample.startsWith('```')) {
+                  isJsonStream = true;
+                }
+              }
+              if (isJsonStream) {
+                if (!hasPlaceholder) {
+                  bubble.innerHTML = this._renderMarkdown('_Generating response..._');
+                  hasPlaceholder = true;
+                }
+              } else {
+                bubble.innerHTML = this._renderMarkdown(rawText);
+                this._scrollToBottom();
+              }
             }
 
             if (event.done && event.diagnosis) {
@@ -711,7 +715,7 @@ class ChatUI {
 
       if (diagnosis) {
         const displayText = this._formatDiagnosis(diagnosis, rawText);
-        bubble.innerHTML = this._renderMarkdown(displayText);
+        await this._streamMarkdownText(bubble, displayText);
         this._addCodeCopyButtons(bubble);
 
         const metaWrapper = this._createMetaBar(diagnosis, displayText);
@@ -806,6 +810,23 @@ class ChatUI {
         : html;
     } catch (_) {
       return text.replace(/\n/g, '<br>');
+    }
+  }
+
+  async _streamMarkdownText(targetEl, fullText) {
+    if (!targetEl) return;
+    const parts = fullText.split(/(\s+)/);
+    const chunkSize = 5;
+    let index = 0;
+    let current = '';
+
+    while (index < parts.length) {
+      const next = parts.slice(index, index + chunkSize).join('');
+      current += next;
+      index += chunkSize;
+      targetEl.innerHTML = this._renderMarkdown(current);
+      this._scrollToBottom();
+      await new Promise((resolve) => setTimeout(resolve, 60));
     }
   }
 
