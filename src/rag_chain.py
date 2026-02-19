@@ -239,28 +239,110 @@ def _user_messages(messages: list[BaseMessage]) -> list[str]:
     return results
 
 
-def _answer_conversational(query: str, history: list[BaseMessage]) -> tuple[str, str, float]:
-    q = query.lower().strip()
-    user_msgs = _user_messages(history)
+def _find_mentions(messages: list[BaseMessage], topic: str) -> list[str]:
+    """Return lines where the topic appears in session messages (user+AI).
 
+    Format: "[role #] <snippet>" where role is User/AI and # is 1-based index in session.
+    """
+    out: list[str] = []
+    t = topic.lower()
+    for i, m in enumerate(messages, start=1):
+        # content may be non-string; coerce safely
+        content = m.content if isinstance(m.content, str) else str(m.content)
+        if t in content.lower():
+            role = "User" if m.type == "human" else "AI"
+            snippet = content.strip().replace("\n", " ")[:300]
+            out.append(f"[{role} #{i}] {snippet}")
+    return out
+
+
+def _answer_conversational(
+    query: str,
+    history: list[BaseMessage],
+    store: "MilvusStore | None" = None,
+) -> tuple[str, str, float, list[str], list[str]]:
+    q = query.lower().strip()
+    # Defensive: ensure history is a list
+    if history is None:
+        history = []
+    user_msgs = _user_messages(history)
+    logger.debug("_answer_conversational: q=%s user_msgs=%d", q, len(user_msgs))
+
+    # first / last
     if re.search(r"\bfirst (question|message)\b", q):
         if user_msgs:
-            return f"Your first question was: {user_msgs[0]}", "", 0.9
-        return "I do not have any prior questions in this session.", "", 0.3
+            return f"Your first question was: {user_msgs[0]}", "", 0.9, [], []
+        return "I do not have any prior questions in this session.", "", 0.3, [], []
 
     if re.search(r"\b(last|previous) question\b", q) or "what did i ask" in q:
         if user_msgs:
-            return f"Your last question was: {user_msgs[-1]}", "", 0.9
-        return "I do not have any prior questions in this session.", "", 0.3
+            return f"Your last question was: {user_msgs[-1]}", "", 0.9, [], []
+        return "I do not have any prior questions in this session.", "", 0.3, [], []
 
-    m = re.search(r"(?:have i|did i) ask(?:ed)? about (.+)", q)
+    # have I asked you about <topic>
+    # Handles: "have i asked you about X", "have i asked about X",
+    #          "did i ask you about X", "did i ask about X",
+    #          "have i mentioned X", "did i mention X"
+    logger.debug("_answer_conversational: checking 'have I asked' pattern")
+    m = re.search(
+        r"(?:have i|did i)"
+        r"\s+(?:ask(?:ed)?|mention(?:ed)?|talk(?:ed)?\s+about|bring\s+up|discuss(?:ed)?)"
+        r"\s+(?:you\s+)?(?:about\s+)?(.+)",
+        q,
+    )
+    logger.debug("_answer_conversational: have_i_match=%s", bool(m))
     if m:
-        topic = m.group(1).strip("?.!")
-        asked = any(topic.lower() in msg.lower() for msg in user_msgs)
-        answer = "Yes" if asked else "No"
-        return f"{answer}, you asked about {topic}.", "", 0.8
+        topic = m.group(1).strip("?.! ")
+        # strip trailing noise words like 'today' or 'where'
+        topic = re.sub(r"\b(today|now|recently|where)\b", "", topic)
+        # truncate at trailing conjunction clauses ("and what did you say", "or where", etc.)
+        topic = re.split(r"\s+(?:and|or|but|nor)\b", topic)[0]
+        # strip any remaining punctuation/whitespace
+        topic = re.sub(r"[?.!,]+", "", topic).strip()
+        logger.debug("_answer_conversational: extracted topic='%s'", topic)
 
-    return "I can answer questions about our conversation in this session.", "", 0.4
+        mentions = _find_mentions(history, topic)
+        logger.debug("_answer_conversational: mentions_found=%d", len(mentions))
+        if mentions:
+            # If user asks 'where', return the locations (message snippets)
+            if "where" in q or (q.endswith("?") and "where" in query.lower()):
+                joined = "; ".join(mentions[:5])
+                return f"Yes — mentioned in session.", f"{joined}", 0.9, [], mentions
+            # Otherwise give a short yes/no plus the first mention
+            return f"Yes, you mentioned {topic} earlier.", f"{mentions[0]}", 0.9, [], [mentions[0]]
+
+        # No session mentions — fall back to KB search (reuse existing store if provided)
+        docs = []
+        try:
+            logger.debug("_answer_conversational: falling back to KB search for '%s'", topic)
+            _store = store if store is not None else MilvusStore()
+            docs = _store.search(topic)
+            logger.debug("_answer_conversational: kb_docs_found=%d", len(docs))
+        except Exception as e:
+            logger.exception("_answer_conversational: KB search error: %s", e)
+            docs = []
+
+        if docs:
+            sources: list[str] = []
+            evidence: list[str] = []
+            for d in docs[:4]:
+                src = d.metadata.get("source", "?")
+                idx = src.find("data/")
+                src_clean = src[idx:] if idx != -1 else src
+                snippet = d.page_content.strip().replace("\n", " ")[:220]
+                sources.append(src_clean)
+                evidence.append(f"{src_clean}: {snippet}")
+            return (
+                f"No prior mentions in session. I found related documents in the KB.",
+                "See evidence and sources.",
+                0.7,
+                sources,
+                evidence,
+            )
+
+        return f"No, I don't see any prior mentions of {topic} in this session.", "", 0.6, [], []
+
+    return "I can answer questions about our conversation in this session.", "", 0.4, [], []
 
 
 def _answer_operational(query: str) -> tuple[str, str, str, float]:
@@ -327,14 +409,14 @@ class RAGChain:
         response_type = _classify_query(query)
 
         if response_type == "conversational":
-            root, explanation, conf = _answer_conversational(query, history)
+            root, explanation, conf, sources, evidence = _answer_conversational(query, history, self.store)
             diagnosis = FailureDiagnosis(
                 root_cause=root,
                 explanation=explanation,
                 recommended_fix="N/A",
                 confidence=conf,
-                sources=[],
-                evidence_snippets=[],
+                sources=sources,
+                evidence_snippets=evidence,
                 response_type=response_type,
                 model_used="rules",
             )

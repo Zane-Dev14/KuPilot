@@ -32,6 +32,9 @@ from src.vectorstore import MilvusStore
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+# Enable debug logging for rag chain during troubleshooting
+logging.getLogger("src.rag_chain").setLevel(logging.DEBUG)
+logging.getLogger("src.vectorstore").setLevel(logging.DEBUG)
 
 # ── Pydantic schemas ─────────────────────────────────────────────────────────
 

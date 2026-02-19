@@ -224,3 +224,151 @@ class TestIngestion:
         docs = ingest_file(p)
         assert docs == []
         p.unlink()
+
+
+# ─── Query classifier ────────────────────────────────────────────────────────
+
+class TestQueryClassifier:
+    def _cls(self, q):
+        from src.rag_chain import _classify_query
+        return _classify_query(q)
+
+    def test_have_i_asked_you_about(self):
+        assert self._cls("Have i asked you about OOMKilled today? where?") == "conversational"
+
+    def test_have_i_asked_about(self):
+        assert self._cls("Have i asked about CrashLoopBackOff?") == "conversational"
+
+    def test_did_i_ask_you_about(self):
+        assert self._cls("Did i ask you about scheduling failures?") == "conversational"
+
+    def test_did_i_ask_about(self):
+        assert self._cls("Did i ask about imagepull?") == "conversational"
+
+    def test_first_question(self):
+        assert self._cls("What was my first question?") == "conversational"
+
+    def test_last_question(self):
+        assert self._cls("What was my last question?") == "conversational"
+
+    def test_summary(self):
+        assert self._cls("Can you give me a summary?") == "conversational"
+
+    def test_kubectl_operational(self):
+        assert self._cls("kubectl get pods -n kube-system") == "operational"
+
+    def test_k8s_diagnostic(self):
+        assert self._cls("Why is my pod OOMKilled?") == "diagnostic"
+
+    def test_out_of_scope(self):
+        assert self._cls("What is the weather today?") == "out_of_scope"
+
+
+# ─── Conversational handler (no I/O) ─────────────────────────────────────────
+
+class TestAnswerConversational:
+    """Tests _answer_conversational() with hand-crafted message history.
+
+    No Milvus or Ollama calls — KB fallback is only triggered when no session
+    mentions exist, and since we mock history with mentions, that path is not
+    exercised here (it requires Milvus to be up).
+    """
+
+    def _make_history(self, pairs):
+        """Build a list of BaseMessage from [(role, content)] pairs."""
+        from langchain_core.messages import HumanMessage, AIMessage
+        msgs = []
+        for role, content in pairs:
+            msgs.append(HumanMessage(content=content) if role == "human" else AIMessage(content=content))
+        return msgs
+
+    def _call(self, query, history):
+        from src.rag_chain import _answer_conversational
+        return _answer_conversational(query, history)
+
+    def test_returns_5_tuple(self):
+        result = self._call("Have i asked you about OOMKilled?", [])
+        assert isinstance(result, tuple) and len(result) == 5
+
+    def test_have_i_asked_with_mention_in_history(self):
+        history = self._make_history([
+            ("human", "Why is my pod OOMKilled?"),
+            ("ai", "The pod exceeded its memory limit and was OOMKilled."),
+        ])
+        root, explanation, conf, sources, evidence = self._call(
+            "Have i asked you about OOMKilled today? where?", history
+        )
+        assert "yes" in root.lower() or "oomkilled" in root.lower()
+        assert conf >= 0.8
+        # evidence snippets should reference messages from history
+        assert len(evidence) > 0
+
+    def test_have_i_asked_no_mention_returns_gracefully(self):
+        """When topic was not mentioned and KB is unavailable, should return valid tuple."""
+        history = self._make_history([
+            ("human", "What is a Pod?"),
+        ])
+        # MilvusStore will fail here (no server); the function must not raise
+        root, explanation, conf, sources, evidence = self._call(
+            "Have i asked you about CrashLoopBackOff?", history
+        )
+        assert isinstance(root, str) and len(root) > 0
+        assert isinstance(conf, float)
+
+    def test_first_question(self):
+        history = self._make_history([
+            ("human", "What is OOMKilled?"),
+            ("ai", "It means the container was out-of-memory killed."),
+        ])
+        root, _, conf, _, _ = self._call("What was my first question?", history)
+        assert "What is OOMKilled?" in root
+        assert conf >= 0.8
+
+    def test_last_question(self):
+        history = self._make_history([
+            ("human", "First question"),
+            ("human", "Second question"),
+        ])
+        root, _, conf, _, _ = self._call("What was my last question?", history)
+        assert "Second question" in root
+
+    def test_empty_history_returns_valid(self):
+        root, _, conf, _, _ = self._call("Have i asked you about OOMKilled?", [])
+        # No session history + Milvus down → graceful fallback
+        assert isinstance(root, str) and len(root) > 0
+
+
+# ─── Find mentions ────────────────────────────────────────────────────────────
+
+class TestFindMentions:
+    def _make_history(self, pairs):
+        from langchain_core.messages import HumanMessage, AIMessage
+        return [
+            HumanMessage(content=c) if r == "human" else AIMessage(content=c)
+            for r, c in pairs
+        ]
+
+    def test_finds_topic_in_user_message(self):
+        from src.rag_chain import _find_mentions
+        history = self._make_history([
+            ("human", "Why is my pod OOMKilled?"),
+            ("ai", "Memory limit exceeded."),  # does NOT contain oomkilled
+        ])
+        mentions = _find_mentions(history, "oomkilled")
+        assert len(mentions) == 1  # only the human message matches
+
+    def test_case_insensitive(self):
+        from src.rag_chain import _find_mentions
+        history = self._make_history([("human", "OOMKilled pod issue")])
+        assert len(_find_mentions(history, "oomkilled")) == 1
+
+    def test_no_match_returns_empty(self):
+        from src.rag_chain import _find_mentions
+        history = self._make_history([("human", "pod scheduling failure")])
+        assert _find_mentions(history, "oomkilled") == []
+
+    def test_none_history_via_conversational(self):
+        """_answer_conversational with None history should not raise."""
+        from src.rag_chain import _answer_conversational
+        result = _answer_conversational("Have i asked about oomkilled?", None)
+        assert len(result) == 5
