@@ -33,6 +33,11 @@ class Settings(BaseSettings):
     # ── Logging ──────────────────────────────────────────
     log_level: str = "INFO"
 
+    # ── Chat Memory ──────────────────────────────────────
+    memory_path: str = "data/chat_memory.json"
+    memory_max_messages: int = 40
+    memory_max_sessions: int = 256
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

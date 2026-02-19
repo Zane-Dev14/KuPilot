@@ -18,7 +18,7 @@ if str(ROOT) not in sys.path:
 
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
@@ -215,6 +215,39 @@ async def diagnose(request: DiagnoseRequest):
         )
     except Exception as e:
         logger.error(f"Diagnosis failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/diagnose/stream")
+async def diagnose_stream(request: DiagnoseRequest):
+    """Stream diagnosis via SSE. Tokens arrive as `data: {"token": "..."}` events,
+    final structured result as `data: {"done": true, "diagnosis": {...}}`."""
+    try:
+        chain = get_rag_chain()
+        force_model = request.force_model
+        if force_model in (None, "", "string"):
+            force_model = None
+
+        async def event_generator():
+            try:
+                async for event in chain.diagnose_stream(
+                    request.question,
+                    request.session_id or "default",
+                    force_model,
+                ):
+                    yield event
+            except Exception as e:
+                logger.error(f"Stream error: {e}", exc_info=True)
+                import json as _json
+                yield f"data: {_json.dumps({'error': str(e)})}\n\n"
+
+        return StreamingResponse(
+            event_generator(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+    except Exception as e:
+        logger.error(f"Stream setup failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 

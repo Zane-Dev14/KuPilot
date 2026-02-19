@@ -9,6 +9,7 @@ Key features:
 
 import json
 import logging
+import os
 import re
 from typing import Optional
 
@@ -191,6 +192,26 @@ _PROMPT = ChatPromptTemplate.from_messages([
      "USER QUERY:\n{query}"),
 ])
 
+_CLASSIFIER_SYSTEM = """\
+You are a router for a Kubernetes diagnosis assistant.
+
+Decide the response type:
+- diagnostic: Kubernetes troubleshooting, failure analysis, or follow-up to a Kubernetes issue.
+- conversational: Questions about the conversation itself (e.g., what did I ask before?).
+- operational: Requests to run commands or list resources (kubectl, list pods, etc.).
+- out_of_scope: Not related to Kubernetes or cluster operations.
+
+Use chat history to interpret short follow-ups (e.g., "What else could cause this?").
+Return ONLY JSON: {"response_type": "diagnostic|conversational|operational|out_of_scope"}.
+"""
+
+_CLASSIFIER_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", _CLASSIFIER_SYSTEM),
+    ("human",
+     "CHAT HISTORY:\n{history}\n\n"
+     "USER QUERY:\n{query}"),
+])
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -216,8 +237,41 @@ def _format_history(messages: list[BaseMessage]) -> str:
     return "\n".join(lines)
 
 
-def _classify_query(query: str) -> str:
+def _format_memory_text(dx: FailureDiagnosis) -> str:
+    parts = [f"Root Cause: {dx.root_cause}"]
+    if dx.explanation:
+        parts.append(f"Explanation: {dx.explanation}")
+    if dx.recommended_fix and dx.recommended_fix != "N/A":
+        parts.append(f"Recommended Fix: {dx.recommended_fix}")
+    return "\n".join(parts)
+
+
+def _classify_query(query: str, history: list[BaseMessage] | None = None) -> str:
+    history = history or []
     q = query.lower().strip()
+
+    # Always try LLM classification first (skip in pytest to keep tests offline).
+    if "PYTEST_CURRENT_TEST" not in os.environ:
+        try:
+            llm = ChatOllama(
+                model=get_settings().simple_model,
+                temperature=0,
+                base_url=get_settings().ollama_base_url,
+            )
+            chain = _CLASSIFIER_PROMPT | llm
+            result = chain.invoke({
+                "history": _format_history(history),
+                "query": query,
+            })
+            raw = result.content if hasattr(result, "content") else str(result)
+            parsed = _parse_json(str(raw))
+            response_type = (parsed.get("response_type") or parsed.get("type") or "").strip()
+            if response_type in {"diagnostic", "conversational", "operational", "out_of_scope"}:
+                return response_type
+        except Exception as exc:
+            logger.warning("LLM classifier failed, falling back: %s", exc)
+
+    # Fallback heuristics (used when LLM is unavailable)
     if any(re.search(p, q) for p in _CONVERSATION_PATTERNS):
         return "conversational"
     if any(re.search(p, q) for p in _OPERATIONAL_PATTERNS):
@@ -226,6 +280,18 @@ def _classify_query(query: str) -> str:
         return "diagnostic"
     if any(_fuzzy_term_in(term, q) for term in _TECHNICAL_KW):
         return "diagnostic"
+
+    if history:
+        recent = history[-6:]
+        recent_text = " ".join(
+            (m.content if isinstance(m.content, str) else str(m.content)).lower()
+            for m in recent
+        )
+        has_k8s_context = any(_term_in(t, recent_text) for t in _K8S_TERMS) or \
+                          any(kw in recent_text for kw in _TECHNICAL_KW)
+        if has_k8s_context:
+            return "diagnostic"
+
     return "out_of_scope"
 
 
@@ -404,9 +470,9 @@ class RAGChain:
         session_id: str = "default",
         force_model: str | None = None,
     ) -> FailureDiagnosis:
-        # 1. Classify request type
+        # 1. Classify request type (pass history for context-aware follow-ups)
         history = self.memory.get_history(session_id)
-        response_type = _classify_query(query)
+        response_type = _classify_query(query, history)
 
         if response_type == "conversational":
             root, explanation, conf, sources, evidence = _answer_conversational(query, history, self.store)
@@ -510,9 +576,127 @@ class RAGChain:
                 model_used=model_name,
             )
 
-        # 7. Update memory — store the full answer, not just root_cause
+        # 7. Update memory — store a richer summary for follow-ups
         self.memory.add_user_message(session_id, query)
-        summary = f"{diagnosis.root_cause}. {diagnosis.explanation}"
-        self.memory.add_ai_message(session_id, summary[:600])
+        self.memory.add_ai_message(session_id, _format_memory_text(diagnosis)[:1200])
 
         return diagnosis
+
+    async def diagnose_stream(
+        self,
+        query: str,
+        session_id: str = "default",
+        force_model: str | None = None,
+    ):
+        """Async generator that yields SSE-formatted strings.
+
+        For non-diagnostic queries (rule-based), yields the full answer at once.
+        For diagnostic queries, streams tokens from the LLM then yields metadata.
+        """
+        import asyncio
+
+        history = self.memory.get_history(session_id)
+        response_type = _classify_query(query, history)
+
+        # ── Non-diagnostic paths: yield complete answer instantly ──
+        if response_type != "diagnostic":
+            if response_type == "conversational":
+                root, explanation, conf, sources, evidence = _answer_conversational(
+                    query, history, self.store
+                )
+                diagnosis = FailureDiagnosis(
+                    root_cause=root, explanation=explanation,
+                    recommended_fix="N/A", confidence=conf,
+                    sources=sources, evidence_snippets=evidence,
+                    response_type=response_type, model_used="rules",
+                )
+            elif response_type == "operational":
+                root, explanation, fix, conf = _answer_operational(query)
+                diagnosis = FailureDiagnosis(
+                    root_cause=root, explanation=explanation,
+                    recommended_fix=fix, confidence=conf,
+                    sources=[], evidence_snippets=[],
+                    response_type=response_type, model_used="rules",
+                )
+            else:
+                root, explanation, conf = _answer_out_of_scope()
+                diagnosis = FailureDiagnosis(
+                    root_cause=root, explanation=explanation,
+                    recommended_fix="N/A", confidence=conf,
+                    sources=[], evidence_snippets=[],
+                    response_type=response_type, model_used="rules",
+                )
+
+            self.memory.add_user_message(session_id, query)
+            self.memory.add_ai_message(session_id, _format_memory_text(diagnosis)[:1200])
+
+            # Yield the full text as a single token event, then done
+            full_text = f"{diagnosis.root_cause}\n\n{diagnosis.explanation}"
+            if diagnosis.recommended_fix and diagnosis.recommended_fix != "N/A":
+                full_text += f"\n\n**Recommended Fix:**\n{diagnosis.recommended_fix}"
+            yield f"data: {json.dumps({'token': full_text})}\n\n"
+            yield f"data: {json.dumps({'done': True, 'diagnosis': diagnosis.model_dump()})}\n\n"
+            return
+
+        # ── Diagnostic path: stream LLM tokens ──
+        docs = await asyncio.to_thread(self.store.search, query)
+        logger.info("Retrieved %d docs for streaming query", len(docs))
+
+        model_name = select_model(query, force_model)
+        context_str = _format_docs(docs)
+        history_str = _format_history(history)
+
+        llm = ChatOllama(
+            model=model_name,
+            temperature=0,
+            base_url=get_settings().ollama_base_url,
+        )
+        chain = _PROMPT | llm
+
+        raw_text = ""
+        async for chunk in chain.astream({
+            "context": context_str,
+            "history": history_str,
+            "query": query,
+        }):
+            token = chunk.content if hasattr(chunk, "content") else str(chunk)
+            if token:
+                raw_text += str(token)
+                yield f"data: {json.dumps({'token': token})}\n\n"
+
+        # Parse accumulated text into structured diagnosis
+        parsed = _parse_json(str(raw_text))
+        root_cause = parsed.get("root_cause") or str(raw_text)[:300]
+        explanation = parsed.get("explanation") or ""
+        fix = parsed.get("recommended_fix") or ""
+        try:
+            conf = float(parsed.get("confidence") or 0.5)
+            conf = max(0.0, min(1.0, conf))
+        except (ValueError, TypeError):
+            conf = 0.5
+
+        raw_sources = [d.metadata.get("source", "?") for d in docs]
+        clean_sources: list[str] = []
+        for s in raw_sources:
+            idx = s.find("data/")
+            clean_sources.append(s[idx:] if idx != -1 else s)
+
+        evidence_snippets: list[str] = []
+        for d in docs[:3]:
+            src = d.metadata.get("source", "?")
+            idx = src.find("data/")
+            src = src[idx:] if idx != -1 else src
+            snippet = d.page_content.strip().replace("\n", " ")[:220]
+            evidence_snippets.append(f"{src}: {snippet}")
+
+        diagnosis = FailureDiagnosis(
+            root_cause=root_cause, explanation=explanation,
+            recommended_fix=fix, confidence=conf,
+            sources=clean_sources, evidence_snippets=evidence_snippets,
+            response_type=response_type, model_used=model_name,
+        )
+
+        self.memory.add_user_message(session_id, query)
+        self.memory.add_ai_message(session_id, _format_memory_text(diagnosis)[:1200])
+
+        yield f"data: {json.dumps({'done': True, 'diagnosis': diagnosis.model_dump()})}\n\n"
