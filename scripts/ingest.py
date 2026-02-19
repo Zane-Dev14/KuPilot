@@ -33,6 +33,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Ingest documents into the knowledge base")
     parser.add_argument("--path", type=str, default=str(SAMPLE_DIR),
                         help="File or directory to ingest (default: data/sample/)")
+    parser.add_argument("--no-drop", action="store_true",
+                        help="Append to collection instead of wiping it (default: wipe for clean schema)")
     args = parser.parse_args()
 
     target = Path(args.path)
@@ -52,8 +54,13 @@ def main() -> None:
         console.print("[yellow]No documents found.[/yellow]")
         return
 
-    # Store in Milvus (drop_old to ensure clean schema)
-    store = MilvusStore(drop_old=True)
+    # Store in Milvus
+    drop_old = not args.no_drop
+    store = MilvusStore(drop_old=drop_old)
+    if args.no_drop:
+        console.print("[yellow]📎 Appending to existing collection[/yellow]")
+    else:
+        console.print("[yellow]🗑️  Wiping collection for clean schema[/yellow]")
     ids = store.add_documents(docs)
 
     # Summary table

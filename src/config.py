@@ -21,7 +21,7 @@ class Settings(BaseSettings):
 
     # ── LLMs (Ollama) ────────────────────────────────────
     simple_model: str = "llama3.1:8b-instruct-q8_0"
-    complex_model: str = "deepseek-r1:32b"
+    complex_model: str = "Qwen3-coder:30b"
     ollama_base_url: str = "http://localhost:11434"
     query_complexity_threshold: float = 0.7
 

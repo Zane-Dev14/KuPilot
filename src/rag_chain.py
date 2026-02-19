@@ -1,7 +1,7 @@
 """RAG diagnosis chain — retrieval + adaptive model selection + generation.
 
 Key features:
-  * Multi-model: simple queries → llama3.1, complex → deepseek-r1:32b
+  * Multi-model: simple queries → llama3.1, complex → Qwen3-Coder:30b
   * Reranking:   vector search → cross-encoder rerank → top-K context
   * Memory:      includes recent chat history in the prompt
   * Structured:  returns FailureDiagnosis pydantic model
@@ -10,6 +10,7 @@ Key features:
 import json
 import logging
 import re
+from pathlib import PurePosixPath
 from typing import Optional
 
 from langchain_core.documents import Document
@@ -39,27 +40,69 @@ class FailureDiagnosis(BaseModel):
 
 # ── Model selector (heuristic) ───────────────────────────────────────────────
 
-_REASONING_KW = ["why", "explain", "diagnose", "troubleshoot", "root cause", "how"]
-_UNCERTAIN_KW = ["maybe", "could", "might", "possibly", "not sure"]
+_REASONING_KW = ["why", "explain", "diagnose", "troubleshoot", "root cause",
+                 "how", "analyze", "investigate", "debug", "cause"]
+_UNCERTAIN_KW = ["maybe", "could", "might", "possibly", "not sure",
+                 "intermittent", "sometimes", "random"]
+_COMPOUND_KW  = ["and", "but", "also", "plus", "additionally", "as well",
+                 "however", "although", "even though", "while"]
+_TECHNICAL_KW = ["oomkilled", "oom", "crashloopbackoff", "crashloop",
+                 "imagepullbackoff", "imagepull", "failedscheduling",
+                 "evicted", "cordon", "taint", "affinity", "pdb",
+                 "hpa", "vpa", "resource quota", "limitrange",
+                 "network policy", "init container", "sidecar",
+                 "liveness", "readiness", "startup probe",
+                 "persistent volume", "configmap", "secret"]
+
+
+def _word_in(word: str, text: str) -> bool:
+    """Check if a multi-word keyword appears in text (word-boundary-aware)."""
+    return bool(re.search(r'\b' + re.escape(word) + r'\b', text))
 
 
 def estimate_complexity(query: str) -> float:
-    """Score 0.0–1.0 based on keyword heuristics."""
+    """Score 0.0–1.0 based on keyword heuristics.
+
+    Each matching signal adds to the score independently so that
+    multi-faceted queries reliably cross the routing threshold.
+    """
     q = query.lower()
     score = 0.0
-    if any(kw in q for kw in _REASONING_KW):
-        score += 0.3
-    if q.count("?") > 1:
-        score += min(0.2 * (q.count("?") - 1), 0.4)
-    if len(query) > 200:
-        score += 0.1
-    if any(kw in q for kw in _UNCERTAIN_KW):
-        score += 0.2
-    return min(score, 1.0)
+
+    # Reasoning keywords — each match adds weight (capped)
+    reasoning_hits = sum(1 for kw in _REASONING_KW if _word_in(kw, q))
+    score += min(reasoning_hits * 0.20, 0.50)
+
+    # Uncertainty / ambiguity
+    if any(_word_in(kw, q) for kw in _UNCERTAIN_KW):
+        score += 0.15
+
+    # Multiple question marks → multi-part question
+    qmarks = q.count("?")
+    if qmarks > 1:
+        score += min(qmarks * 0.10, 0.30)
+
+    # Compound / multi-clause
+    compound_hits = sum(1 for kw in _COMPOUND_KW if _word_in(kw, q))
+    if compound_hits:
+        score += min(compound_hits * 0.10, 0.20)
+
+    # Technical depth
+    tech_hits = sum(1 for kw in _TECHNICAL_KW if kw in q)
+    score += min(tech_hits * 0.10, 0.30)
+
+    # Length signals (longer = more context = harder)
+    words = len(query.split())
+    if words > 15:
+        score += 0.10
+    if words > 30:
+        score += 0.10
+
+    return round(min(score, 1.0), 2)
 
 
 def select_model(query: str, force: str | None = None) -> str:
-    """Pick llama3.1 or deepseek-r1:32b based on complexity."""
+    """Pick llama3.1 or Qwen3-Coder:30b based on complexity."""
     if force:
         return force
     s = get_settings()
@@ -72,19 +115,36 @@ def select_model(query: str, force: str | None = None) -> str:
 # ── Prompt ────────────────────────────────────────────────────────────────────
 
 _SYSTEM = """\
-You are a Kubernetes failure diagnosis expert.
-Given the CONTEXT (retrieved documents) and the USER QUERY, respond with a JSON object:
+You are a Kubernetes failure diagnosis expert integrated with a RAG knowledge base.
+
+RULES:
+1. Base your answers ONLY on the CONTEXT documents and CHAT HISTORY provided.
+   Do NOT invent pod names, namespaces, or details that are not in the context.
+2. If the user asks a conversational question (e.g. "what did I ask before?",
+   "summarise our chat", yes/no questions), answer it naturally using CHAT HISTORY.
+   Still use the JSON format but put your natural answer in "root_cause" and
+   set "recommended_fix" to "N/A".
+3. If the question is completely outside Kubernetes operations, reply helpfully
+   but set confidence to 0.0 and recommended_fix to "N/A".
+4. When diagnosing failures, cite specific evidence from the context (event
+   messages, resource values, error strings, timestamps) rather than giving
+   generic advice.
+5. For the fix, give concrete steps or commands, not vague suggestions.
+
+Always respond with ONLY this JSON (no markdown fences, no extra text):
 {{
-  "root_cause": "...",
-  "explanation": "...",
-  "recommended_fix": "...",
+  "root_cause": "<concise root cause or direct answer>",
+  "explanation": "<detailed explanation citing evidence from context>",
+  "recommended_fix": "<specific actionable steps>",
   "confidence": 0.0-1.0
-}}
-Be concise, technical, and actionable.  Return ONLY the JSON object."""
+}}"""
 
 _PROMPT = ChatPromptTemplate.from_messages([
     ("system", _SYSTEM),
-    ("human", "CONTEXT:\n{context}\n\nCHAT HISTORY:\n{history}\n\nUSER QUERY:\n{query}"),
+    ("human",
+     "CONTEXT (retrieved documents):\n{context}\n\n"
+     "CHAT HISTORY (recent conversation):\n{history}\n\n"
+     "USER QUERY:\n{query}"),
 ])
 
 
@@ -103,11 +163,11 @@ def _format_docs(docs: list[Document]) -> str:
 
 def _format_history(messages: list[BaseMessage]) -> str:
     if not messages:
-        return "(none)"
+        return "(no previous conversation)"
     lines = []
-    for m in messages[-6:]:                       # last 3 turns
+    for m in messages[-10:]:                      # last 5 turns
         role = "User" if m.type == "human" else "AI"
-        lines.append(f"{role}: {m.content[:200]}")
+        lines.append(f"{role}: {m.content[:500]}")
     return "\n".join(lines)
 
 
@@ -177,18 +237,37 @@ class RAGChain:
         raw_text = result.content if hasattr(result, "content") else str(result)
 
         # 5. Parse output → FailureDiagnosis
-        parsed = _parse_json(raw_text)
+        parsed = _parse_json(str(raw_text))
+
+        # Null-safe extraction — LLMs sometimes return null for fields
+        root_cause = parsed.get("root_cause") or str(raw_text)[:300]
+        explanation = parsed.get("explanation") or ""
+        fix = parsed.get("recommended_fix") or ""
+        try:
+            conf = float(parsed.get("confidence") or 0.5)
+            conf = max(0.0, min(1.0, conf))
+        except (ValueError, TypeError):
+            conf = 0.5
+
+        # Clean source paths — show just the relative data/ portion
+        raw_sources = [d.metadata.get("source", "?") for d in docs]
+        clean_sources: list[str] = []
+        for s in raw_sources:
+            idx = s.find("data/")
+            clean_sources.append(s[idx:] if idx != -1 else s)
+
         diagnosis = FailureDiagnosis(
-            root_cause=parsed.get("root_cause", raw_text[:200]),
-            explanation=parsed.get("explanation", ""),
-            recommended_fix=parsed.get("recommended_fix", ""),
-            confidence=float(parsed.get("confidence", 0.5)),
-            sources=[d.metadata.get("source", "?") for d in docs],
+            root_cause=root_cause,
+            explanation=explanation,
+            recommended_fix=fix,
+            confidence=conf,
+            sources=clean_sources,
             model_used=model_name,
         )
 
-        # 6. Update memory
+        # 6. Update memory — store the full answer, not just root_cause
         self.memory.add_user_message(session_id, query)
-        self.memory.add_ai_message(session_id, diagnosis.root_cause)
+        summary = f"{diagnosis.root_cause}. {diagnosis.explanation}"
+        self.memory.add_ai_message(session_id, summary[:600])
 
         return diagnosis

@@ -85,17 +85,43 @@ class TestModelSelector:
     def test_simple_query_low_complexity(self):
         from src.rag_chain import estimate_complexity
         score = estimate_complexity("list pods")
-        assert score < 0.3
+        assert score < 0.2, f"Expected < 0.2, got {score}"
+
+    def test_definition_query_low(self):
+        from src.rag_chain import estimate_complexity
+        score = estimate_complexity("What is CrashLoopBackOff?")
+        assert score < 0.5, f"Expected < 0.5, got {score}"
 
     def test_reasoning_query(self):
         from src.rag_chain import estimate_complexity
         score = estimate_complexity("Why is my pod in CrashLoopBackOff?")
-        assert score >= 0.3
+        assert score >= 0.3, f"Expected >= 0.3, got {score}"
 
     def test_complex_multi_question(self):
         from src.rag_chain import estimate_complexity
         score = estimate_complexity("Why is it crashing? How do I fix it? What caused the OOM?")
-        assert score >= 0.5
+        assert score >= 0.5, f"Expected >= 0.5, got {score}"
+
+    def test_compound_query_high(self):
+        from src.rag_chain import estimate_complexity
+        score = estimate_complexity(
+            "Why is my pod crashing with CrashLoopBackOff AND how do I troubleshoot it?"
+        )
+        assert score >= 0.5, f"Expected >= 0.5, got {score}"
+
+    def test_multi_signal_reaches_threshold(self):
+        from src.rag_chain import estimate_complexity
+        score = estimate_complexity(
+            "Why is my pod OOMKilled even though memory limit is 512Mi? "
+            "How do I diagnose and fix this intermittent issue?"
+        )
+        assert score >= 0.7, f"Expected >= 0.7, got {score}"
+
+    def test_word_boundary_no_false_positive(self):
+        from src.rag_chain import estimate_complexity
+        # 'show' should NOT match 'how', 'shower' should NOT match 'how'
+        score = estimate_complexity("show me the pods")
+        assert score < 0.2, f"Expected < 0.2, got {score}"
 
     def test_force_model_override(self):
         from src.rag_chain import select_model

@@ -22,6 +22,8 @@ from rich.panel import Panel
 from rich.table import Table
 
 logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
+# Suppress noisy async Milvus warning (we only use sync)
+logging.getLogger("langchain_milvus.vectorstores.milvus").setLevel(logging.ERROR)
 
 console = Console()
 
