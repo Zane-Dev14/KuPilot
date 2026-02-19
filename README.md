@@ -39,6 +39,7 @@ chmod +x setup.sh
 # 3. Start Ollama (separate terminal) & pull models
 ollama serve
 ollama pull llama3.1:8b-instruct-q8_0
+ollama pull Qwen3-coder:30b
 
 # 4a. Web UI
 python -m uvicorn src.api:app --reload
