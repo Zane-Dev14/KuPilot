@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>K8s Failure Intelligence Copilot</title>
+  <link rel="stylesheet" href="/static/app.css" />
+</head>
+<body>
+  <div class="bg-glow"></div>
+  <header class="topbar">
+    <div class="brand">
+      <span class="mark">K8s</span>
+      <span class="title">Failure Intelligence Copilot</span>
+    </div>
+    <div class="status" id="status">Ready</div>
+  </header>
+
+  <main class="grid">
+    <section class="panel input-panel">
+      <h1>Ask your cluster</h1>
+      <p class="subtitle">Paste a failure symptom, event, or question. The system retrieves evidence and responds with a structured diagnosis.</p>
+
+      <label class="label">Question</label>
+      <textarea id="question" rows="6" placeholder="Why is my pod crashing with CrashLoopBackOff and how do I fix it?"></textarea>
+
+      <div class="row">
+        <div class="field">
+          <label class="label">Session ID</label>
+          <input id="sessionId" type="text" value="web" />
+        </div>
+        <div class="field">
+          <label class="label">Model override</label>
+          <select id="modelOverride">
+            <option value="">Auto</option>
+            <option value="{{ simple_model }}">Simple ({{ simple_model }})</option>
+            <option value="{{ complex_model }}">Complex ({{ complex_model }})</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="row actions">
+        <button id="askBtn" class="primary">Diagnose</button>
+        <button id="clearBtn" class="ghost">Clear Memory</button>
+        <button id="copyBtn" class="ghost">Copy Response</button>
+      </div>
+
+      <div class="tips">
+        <div class="pill">CrashLoopBackOff</div>
+        <div class="pill">OOMKilled</div>
+        <div class="pill">ImagePullBackOff</div>
+        <div class="pill">FailedScheduling</div>
+      </div>
+    </section>
+
+    <section class="panel output-panel">
+      <div class="output-header">
+        <h2>Diagnosis</h2>
+        <div class="meta">
+          <span class="badge" id="typeBadge">diagnostic</span>
+          <span class="badge" id="modelBadge">model</span>
+          <span class="badge" id="confidenceBadge">0%</span>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>Root Cause</h3>
+        <p id="rootCause">Ask a question to begin.</p>
+      </div>
+
+      <div class="card">
+        <h3>Explanation</h3>
+        <p id="explanation"></p>
+      </div>
+
+      <div class="card">
+        <h3>Recommended Fix</h3>
+        <pre id="fix"></pre>
+      </div>
+
+      <div class="card">
+        <h3>Evidence</h3>
+        <ul id="evidence"></ul>
+      </div>
+
+      <div class="card">
+        <h3>Sources</h3>
+        <ul id="sources"></ul>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    Backend hosted on FastAPI · UI served from / · Docs at /docs
+  </footer>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

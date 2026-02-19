@@ -12,10 +12,15 @@ import sys
 from pathlib import Path
 
 # Add project root to path
-ROOT = Path(__file__).resolve().parent.parent.parent
-sys.path.insert(0, str(ROOT))
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, status
+from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 from typing import Optional
 
@@ -32,7 +37,7 @@ logger = logging.getLogger(__name__)
 
 class DiagnoseRequest(BaseModel):
     """Request to diagnose a K8s failure."""
-    question: str = Field(..., description="Question or failure description")
+    question: str = Field(..., min_length=1, description="Question or failure description")
     namespace: Optional[str] = Field(None, description="Optional namespace filter")
     force_model: Optional[str] = Field(None, description="Override model selection")
     session_id: Optional[str] = Field(default="default", description="Session ID for memory")
@@ -47,7 +52,7 @@ class DiagnoseResponse(BaseModel):
 
 class QueryAnalysisRequest(BaseModel):
     """Request to analyze a query."""
-    question: str = Field(..., description="Question or failure description")
+    question: str = Field(..., min_length=1, description="Question or failure description")
 
 
 class QueryAnalysis(BaseModel):
@@ -77,6 +82,11 @@ class IngestResponse(BaseModel):
     errors: list = Field(default_factory=list)
 
 
+class MemoryClearRequest(BaseModel):
+    """Request to clear a session's memory."""
+    session_id: str = Field(..., description="Session ID to clear")
+
+
 # ── FastAPI app ─────────────────────────────────────────────────────────────
 
 app = FastAPI(
@@ -84,6 +94,10 @@ app = FastAPI(
     version="0.1.0",
     description="RAG-powered diagnosis of Kubernetes failures",
 )
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
+app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
 
 # Initialize services (lazy; will connect on first request)
 _rag_chain: Optional[RAGChain] = None
@@ -108,19 +122,38 @@ def get_milvus_store(drop_old: bool = False) -> MilvusStore:
 
 # ── Endpoints ────────────────────────────────────────────────────────────────
 
+@app.get("/", response_class=HTMLResponse)
+async def index(request: Request):
+    """Web UI for interactive diagnosis."""
+    s = get_settings()
+    return templates.TemplateResponse(
+        "index.html",
+        {
+            "request": request,
+            "simple_model": s.simple_model,
+            "complex_model": s.complex_model,
+        },
+    )
+
 @app.get("/health")
 async def health():
     """Health check endpoint."""
     try:
         store = get_milvus_store()
-        is_healthy = store.health_check()
-        return {
+        is_healthy = await run_in_threadpool(store.health_check)
+        payload = {
             "status": "ok" if is_healthy else "degraded",
             "milvus": "connected" if is_healthy else "disconnected",
         }
+        if not is_healthy:
+            return JSONResponse(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, content=payload)
+        return payload
     except Exception as e:
         logger.error(f"Health check failed: {e}")
-        return {"status": "error", "detail": str(e)}
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={"status": "error", "detail": str(e)},
+        )
 
 
 @app.post("/diagnose", response_model=DiagnoseResponse)
@@ -161,10 +194,15 @@ async def diagnose(request: DiagnoseRequest):
         complexity = estimate_complexity(request.question)
 
         # Diagnose
-        diagnosis = chain.diagnose(
-            query=request.question,
-            session_id=request.session_id or "default",
-            force_model=request.force_model,
+        force_model = request.force_model
+        if force_model in (None, "", "string"):
+            force_model = None
+
+        diagnosis = await run_in_threadpool(
+            chain.diagnose,
+            request.question,
+            request.session_id or "default",
+            force_model,
         )
 
         return DiagnoseResponse(
@@ -258,9 +296,9 @@ async def ingest(request: IngestRequest):
 
         # Load documents
         if target.is_dir():
-            docs = ingest_directory(target)
+            docs = await run_in_threadpool(ingest_directory, target)
         else:
-            docs = ingest_file(target)
+            docs = await run_in_threadpool(ingest_file, target)
 
         if not docs:
             logger.warning(f"No documents found in {target}")
@@ -272,7 +310,7 @@ async def ingest(request: IngestRequest):
             )
 
         # Store in Milvus
-        ids = store.add_documents(docs)
+        ids = await run_in_threadpool(store.add_documents, docs)
 
         result = IngestResponse(
             documents_loaded=len(docs),
@@ -288,6 +326,18 @@ async def ingest(request: IngestRequest):
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         logger.error(f"Ingestion failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/memory/clear")
+async def clear_memory(request: MemoryClearRequest):
+    """Clear chat memory for a session ID."""
+    try:
+        chain = get_rag_chain()
+        chain.memory.clear(request.session_id)
+        return {"status": "ok", "session_id": request.session_id}
+    except Exception as e:
+        logger.error(f"Memory clear failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

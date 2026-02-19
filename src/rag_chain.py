@@ -10,7 +10,6 @@ Key features:
 import json
 import logging
 import re
-from pathlib import PurePosixPath
 from typing import Optional
 
 from langchain_core.documents import Document
@@ -35,6 +34,8 @@ class FailureDiagnosis(BaseModel):
     recommended_fix: str = Field(default="", description="Actionable fix steps")
     confidence: float = Field(default=0.5, description="0.0–1.0")
     sources: list[str] = Field(default_factory=list)
+    evidence_snippets: list[str] = Field(default_factory=list)
+    response_type: str = Field(default="diagnostic", description="diagnostic|conversational|operational|out_of_scope")
     model_used: Optional[str] = None
 
 
@@ -54,10 +55,53 @@ _TECHNICAL_KW = ["oomkilled", "oom", "crashloopbackoff", "crashloop",
                  "liveness", "readiness", "startup probe",
                  "persistent volume", "configmap", "secret"]
 
+_K8S_TERMS = [
+    "k8s", "kubernetes", "pod", "pods", "deployment", "replicaset",
+    "statefulset", "daemonset", "namespace", "node", "cluster",
+    "crashloop", "oomkilled", "imagepull", "ingress", "service",
+    "configmap", "secret", "pvc", "pv", "kube-system", "k3d",
+]
+
+_CONVERSATION_PATTERNS = [
+    r"\bfirst (question|message)\b",
+    r"\bwhat did i ask\b",
+    r"\bwhat was my (first|last|previous) question\b",
+    r"\bhave i asked\b",
+    r"\bdid i ask\b",
+    r"\bsummary\b",
+    r"\bsummarise\b",
+    r"\brecap\b",
+    r"\bremember\b",
+]
+
+_OPERATIONAL_PATTERNS = [
+    r"\b(list|show|get)\s+pods\b",
+    r"\bpods\s+in\s+k3d\b",
+    r"\bk3d\b.*\bpods\b",
+    r"\bpods\b.*\bk3d\b",
+    r"\bkubectl\b",
+]
+
 
 def _word_in(word: str, text: str) -> bool:
     """Check if a multi-word keyword appears in text (word-boundary-aware)."""
     return bool(re.search(r'\b' + re.escape(word) + r'\b', text))
+
+
+def _term_in(term: str, text: str) -> bool:
+    """Word-safe match for short terms (avoids matching 'pod' in 'podcast')."""
+    return bool(re.search(r'(?<!\w)' + re.escape(term) + r'(?!\w)', text))
+
+
+def _fuzzy_term_in(term: str, text: str) -> bool:
+    """Allow near-miss matches for longer terms (e.g., crashloopback -> crashloopbackoff)."""
+    tokens = re.findall(r"[a-z0-9-]+", text)
+    for tok in tokens:
+        if len(tok) < 6:
+            continue
+        if term.startswith(tok) or tok.startswith(term):
+            return True
+    return False
 
 
 def estimate_complexity(query: str) -> float:
@@ -122,10 +166,10 @@ RULES:
    Do NOT invent pod names, namespaces, or details that are not in the context.
 2. If the user asks a conversational question (e.g. "what did I ask before?",
    "summarise our chat", yes/no questions), answer it naturally using CHAT HISTORY.
-   Still use the JSON format but put your natural answer in "root_cause" and
-   set "recommended_fix" to "N/A".
+   Still use the JSON format but put your natural answer in "root_cause",
+   set "recommended_fix" to "N/A", and do NOT cite sources.
 3. If the question is completely outside Kubernetes operations, reply helpfully
-   but set confidence to 0.0 and recommended_fix to "N/A".
+   but set confidence to 0.0, recommended_fix to "N/A", and do NOT cite sources.
 4. When diagnosing failures, cite specific evidence from the context (event
    messages, resource values, error strings, timestamps) rather than giving
    generic advice.
@@ -157,7 +201,8 @@ def _format_docs(docs: list[Document]) -> str:
     for i, d in enumerate(docs, 1):
         src = d.metadata.get("source", "?")
         kind = d.metadata.get("kind") or d.metadata.get("doc_type", "")
-        parts.append(f"[{i}] {kind} — {src}\n{d.page_content}")
+        snippet = d.page_content[:1200]
+        parts.append(f"[{i}] {kind} — {src}\n{snippet}")
     return "\n---\n".join(parts)
 
 
@@ -169,6 +214,73 @@ def _format_history(messages: list[BaseMessage]) -> str:
         role = "User" if m.type == "human" else "AI"
         lines.append(f"{role}: {m.content[:500]}")
     return "\n".join(lines)
+
+
+def _classify_query(query: str) -> str:
+    q = query.lower().strip()
+    if any(re.search(p, q) for p in _CONVERSATION_PATTERNS):
+        return "conversational"
+    if any(re.search(p, q) for p in _OPERATIONAL_PATTERNS):
+        return "operational"
+    if any(_term_in(term, q) for term in _K8S_TERMS):
+        return "diagnostic"
+    if any(_fuzzy_term_in(term, q) for term in _TECHNICAL_KW):
+        return "diagnostic"
+    return "out_of_scope"
+
+
+def _user_messages(messages: list[BaseMessage]) -> list[str]:
+    results: list[str] = []
+    for m in messages:
+        if m.type != "human":
+            continue
+        content = m.content
+        results.append(content if isinstance(content, str) else str(content))
+    return results
+
+
+def _answer_conversational(query: str, history: list[BaseMessage]) -> tuple[str, str, float]:
+    q = query.lower().strip()
+    user_msgs = _user_messages(history)
+
+    if re.search(r"\bfirst (question|message)\b", q):
+        if user_msgs:
+            return f"Your first question was: {user_msgs[0]}", "", 0.9
+        return "I do not have any prior questions in this session.", "", 0.3
+
+    if re.search(r"\b(last|previous) question\b", q) or "what did i ask" in q:
+        if user_msgs:
+            return f"Your last question was: {user_msgs[-1]}", "", 0.9
+        return "I do not have any prior questions in this session.", "", 0.3
+
+    m = re.search(r"(?:have i|did i) ask(?:ed)? about (.+)", q)
+    if m:
+        topic = m.group(1).strip("?.!")
+        asked = any(topic.lower() in msg.lower() for msg in user_msgs)
+        answer = "Yes" if asked else "No"
+        return f"{answer}, you asked about {topic}.", "", 0.8
+
+    return "I can answer questions about our conversation in this session.", "", 0.4
+
+
+def _answer_operational(query: str) -> tuple[str, str, str, float]:
+    q = query.lower().strip()
+    context_hint = ""
+    if "k3d" in q:
+        context_hint = " If you are using k3d, select the correct context with `kubectl config get-contexts` and `kubectl config use-context <name>`."
+
+    root = "I cannot run cluster commands from here, but you can list pods locally."
+    explanation = (
+        "Use kubectl to query the cluster." + context_hint
+    )
+    fix = "Run: kubectl get pods -A (or kubectl get pods -n <namespace>)"
+    return root, explanation, fix, 0.2
+
+
+def _answer_out_of_scope() -> tuple[str, str, float]:
+    root = "I specialize in Kubernetes failure diagnosis and cannot help with that topic."
+    explanation = "Ask a Kubernetes or cluster troubleshooting question to continue."
+    return root, explanation, 0.0
 
 
 def _parse_json(text: str) -> dict:
@@ -210,62 +322,113 @@ class RAGChain:
         session_id: str = "default",
         force_model: str | None = None,
     ) -> FailureDiagnosis:
-        # 1. Retrieve + rerank
-        docs = self.store.search(query)
-        logger.info("Retrieved %d docs for query", len(docs))
-
-        # 2. Select model
-        model_name = select_model(query, force_model)
-
-        # 3. Build prompt inputs
+        # 1. Classify request type
         history = self.memory.get_history(session_id)
-        context_str = _format_docs(docs)
-        history_str = _format_history(history)
+        response_type = _classify_query(query)
 
-        # 4. Call LLM
-        llm = ChatOllama(
-            model=model_name,
-            temperature=0,
-            base_url=get_settings().ollama_base_url,
-        )
-        chain = _PROMPT | llm
-        result = chain.invoke({
-            "context": context_str,
-            "history": history_str,
-            "query": query,
-        })
-        raw_text = result.content if hasattr(result, "content") else str(result)
+        if response_type == "conversational":
+            root, explanation, conf = _answer_conversational(query, history)
+            diagnosis = FailureDiagnosis(
+                root_cause=root,
+                explanation=explanation,
+                recommended_fix="N/A",
+                confidence=conf,
+                sources=[],
+                evidence_snippets=[],
+                response_type=response_type,
+                model_used="rules",
+            )
+        elif response_type == "operational":
+            root, explanation, fix, conf = _answer_operational(query)
+            diagnosis = FailureDiagnosis(
+                root_cause=root,
+                explanation=explanation,
+                recommended_fix=fix,
+                confidence=conf,
+                sources=[],
+                evidence_snippets=[],
+                response_type=response_type,
+                model_used="rules",
+            )
+        elif response_type == "out_of_scope":
+            root, explanation, conf = _answer_out_of_scope()
+            diagnosis = FailureDiagnosis(
+                root_cause=root,
+                explanation=explanation,
+                recommended_fix="N/A",
+                confidence=conf,
+                sources=[],
+                evidence_snippets=[],
+                response_type=response_type,
+                model_used="rules",
+            )
+        else:
+            # 2. Retrieve + rerank
+            docs = self.store.search(query)
+            logger.info("Retrieved %d docs for query", len(docs))
 
-        # 5. Parse output → FailureDiagnosis
-        parsed = _parse_json(str(raw_text))
+            # 3. Select model
+            model_name = select_model(query, force_model)
 
-        # Null-safe extraction — LLMs sometimes return null for fields
-        root_cause = parsed.get("root_cause") or str(raw_text)[:300]
-        explanation = parsed.get("explanation") or ""
-        fix = parsed.get("recommended_fix") or ""
-        try:
-            conf = float(parsed.get("confidence") or 0.5)
-            conf = max(0.0, min(1.0, conf))
-        except (ValueError, TypeError):
-            conf = 0.5
+            # 4. Build prompt inputs
+            context_str = _format_docs(docs)
+            history_str = _format_history(history)
 
-        # Clean source paths — show just the relative data/ portion
-        raw_sources = [d.metadata.get("source", "?") for d in docs]
-        clean_sources: list[str] = []
-        for s in raw_sources:
-            idx = s.find("data/")
-            clean_sources.append(s[idx:] if idx != -1 else s)
+            # 5. Call LLM
+            llm = ChatOllama(
+                model=model_name,
+                temperature=0,
+                base_url=get_settings().ollama_base_url,
+            )
+            chain = _PROMPT | llm
+            result = chain.invoke({
+                "context": context_str,
+                "history": history_str,
+                "query": query,
+            })
+            raw_text = result.content if hasattr(result, "content") else str(result)
 
-        diagnosis = FailureDiagnosis(
-            root_cause=root_cause,
-            explanation=explanation,
-            recommended_fix=fix,
-            confidence=conf,
-            sources=clean_sources,
-            model_used=model_name,
-        )
+            # 6. Parse output → FailureDiagnosis
+            parsed = _parse_json(str(raw_text))
 
-        # 6. Update memory — store the full answer, not just root_cause
+            # Null-safe extraction — LLMs sometimes return null for fields
+            root_cause = parsed.get("root_cause") or str(raw_text)[:300]
+            explanation = parsed.get("explanation") or ""
+            fix = parsed.get("recommended_fix") or ""
+            try:
+                conf = float(parsed.get("confidence") or 0.5)
+                conf = max(0.0, min(1.0, conf))
+            except (ValueError, TypeError):
+                conf = 0.5
+
+            # Clean source paths — show just the relative data/ portion
+            raw_sources = [d.metadata.get("source", "?") for d in docs]
+            clean_sources: list[str] = []
+            for s in raw_sources:
+                idx = s.find("data/")
+                clean_sources.append(s[idx:] if idx != -1 else s)
+
+            # Evidence snippets for UI
+            evidence_snippets: list[str] = []
+            for d in docs[:3]:
+                src = d.metadata.get("source", "?")
+                idx = src.find("data/")
+                src = src[idx:] if idx != -1 else src
+                snippet = d.page_content.strip().replace("\n", " ")[:220]
+                evidence_snippets.append(f"{src}: {snippet}")
+
+            diagnosis = FailureDiagnosis(
+                root_cause=root_cause,
+                explanation=explanation,
+                recommended_fix=fix,
+                confidence=conf,
+                sources=clean_sources,
+                evidence_snippets=evidence_snippets,
+                response_type=response_type,
+                model_used=model_name,
+            )
+
+        # 7. Update memory — store the full answer, not just root_cause
         self.memory.add_user_message(session_id, query)
         summary = f"{diagnosis.root_cause}. {diagnosis.explanation}"
         self.memory.add_ai_message(session_id, summary[:600])
