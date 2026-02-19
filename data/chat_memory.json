@@ -7,6 +7,14 @@
     {
       "type": "ai",
       "content": "Root Cause: I specialize in Kubernetes failure diagnosis and cannot help with that topic.\nExplanation: Ask a Kubernetes or cluster troubleshooting question to continue."
+    },
+    {
+      "type": "human",
+      "content": "what is my name"
+    },
+    {
+      "type": "ai",
+      "content": "Root Cause: N/A\nExplanation: I'm happy to chat, but I don't have any information about your name. Our conversation just started."
     }
   ],
   "web": [
@@ -49,6 +57,38 @@
     {
       "type": "ai",
       "content": "Root Cause: Update the pod's container resource requests and limits\nExplanation: To increase the Kubernetes pod memory limits, you need to update the container's resource requests and limits. You can do this by editing the pod's configuration file or using `kubectl edit` command. Specifically, look for the `resources` section in the container spec and update the `limits.memory` value.\nRecommended Fix: Run `kubectl edit pod <pod_name>` to open the pod's configuration file in an editor, then update the `limits.memory` value under the `resources` section. For example: `limits:`\n  memory: \"128Mi\"\n"
+    },
+    {
+      "type": "human",
+      "content": "Why is my pod in CrashLoopBackOff?"
+    },
+    {
+      "type": "ai",
+      "content": "Root Cause: Container restarts due to crashes\nExplanation: The pod is stuck in CrashLoopBackOff state because one or more containers within the pod are crashing and restarting. This can be caused by a variety of issues such as incorrect configuration, resource constraints, or application errors. Check the container logs for error messages that may indicate the root cause.\nRecommended Fix: Run `kubectl describe pod <pod_name>` to view the pod's events and check for any error messages. Then, run `kubectl logs <pod_name> -c <container_name>` to inspect the container logs for specific errors. Adjust the container configuration or resource requests as necessary to resolve the issue."
+    },
+    {
+      "type": "human",
+      "content": "My name is George"
+    },
+    {
+      "type": "ai",
+      "content": "Root Cause: Your name is George\nExplanation: You've shared your name with me."
+    },
+    {
+      "type": "human",
+      "content": "what is my name"
+    },
+    {
+      "type": "ai",
+      "content": "Root Cause: Your name is George\nExplanation: You mentioned it earlier in our conversation."
+    },
+    {
+      "type": "human",
+      "content": "what is my name"
+    },
+    {
+      "type": "ai",
+      "content": "Root Cause: Your name is George\nExplanation: You mentioned your name earlier in our conversation."
     }
   ]
 }

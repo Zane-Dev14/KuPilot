@@ -1,17 +1,6 @@
-"""Per-session conversation memory.
+"""Per-session conversation memory with LRU eviction and optional disk persistence."""
 
-Stores the last *max_messages* messages per session.
-Sessions are evicted LRU when *max_sessions* is reached.
-
-Usage:
-    mem = get_chat_memory()
-    mem.add_user_message("s1", "Why is my pod crashing?")
-    mem.add_ai_message("s1", "The container is OOMKilled …")
-    history = mem.get_history("s1")   # [HumanMessage, AIMessage]
-"""
-
-import json
-import logging
+import json, logging
 from collections import OrderedDict
 from pathlib import Path
 from typing import Optional
@@ -24,85 +13,63 @@ logger = logging.getLogger(__name__)
 
 
 class ChatMemory:
-    """In-memory, per-session conversation history."""
+    """In-memory per-session history with LRU eviction."""
 
-    def __init__(self, max_messages: int = 20, max_sessions: int = 256) -> None:
-        self.max_messages = max_messages
-        self.max_sessions = max_sessions
+    def __init__(self, max_messages=20, max_sessions=256):
+        self.max_messages, self.max_sessions = max_messages, max_sessions
         self._store: OrderedDict[str, list[BaseMessage]] = OrderedDict()
 
-    # ── public ────────────────────────────────────────────────────────────
-    def add_user_message(self, session_id: str, content: str) -> None:
-        self._ensure(session_id)
-        self._store[session_id].append(HumanMessage(content=content))
-        self._trim(session_id)
+    def add_user_message(self, session_id, content):
+        self._append(session_id, HumanMessage(content=content))
 
-    def add_ai_message(self, session_id: str, content: str) -> None:
-        self._ensure(session_id)
-        self._store[session_id].append(AIMessage(content=content))
-        self._trim(session_id)
+    def add_ai_message(self, session_id, content):
+        self._append(session_id, AIMessage(content=content))
 
-    def get_history(self, session_id: str) -> list[BaseMessage]:
+    def get_history(self, session_id) -> list[BaseMessage]:
         return list(self._store.get(session_id, []))
 
-    def clear(self, session_id: str) -> None:
+    def clear(self, session_id):
         self._store.pop(session_id, None)
+        self._persist()
 
-    def clear_all(self) -> None:
+    def clear_all(self):
         self._store.clear()
+        self._persist()
 
     @property
     def active_sessions(self) -> int:
         return len(self._store)
 
-    # ── internals ─────────────────────────────────────────────────────────
-    def _ensure(self, sid: str) -> None:
+    def _append(self, sid, msg):
         if sid not in self._store:
             if len(self._store) >= self.max_sessions:
-                evicted, _ = self._store.popitem(last=False)
-                logger.debug("Evicted session %s", evicted)
+                self._store.popitem(last=False)
             self._store[sid] = []
         else:
             self._store.move_to_end(sid)
+        self._store[sid].append(msg)
+        if len(self._store[sid]) > self.max_messages:
+            self._store[sid] = self._store[sid][-self.max_messages:]
+        self._persist()
 
-    def _trim(self, sid: str) -> None:
-        msgs = self._store.get(sid)
-        if msgs and len(msgs) > self.max_messages:
-            self._store[sid] = msgs[-self.max_messages:]
+    def _persist(self):
+        """Override in subclass for disk persistence."""
 
 
 class DiskChatMemory(ChatMemory):
-    """Disk-backed memory with JSON persistence."""
+    """Extends ChatMemory with JSON file persistence (atomic writes)."""
 
-    def __init__(self, path: Path, max_messages: int = 20, max_sessions: int = 256) -> None:
-        super().__init__(max_messages=max_messages, max_sessions=max_sessions)
+    def __init__(self, path: Path, **kw):
+        super().__init__(**kw)
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._load()
 
-    def add_user_message(self, session_id: str, content: str) -> None:
-        super().add_user_message(session_id, content)
-        self._save()
-
-    def add_ai_message(self, session_id: str, content: str) -> None:
-        super().add_ai_message(session_id, content)
-        self._save()
-
-    def clear(self, session_id: str) -> None:
-        super().clear(session_id)
-        self._save()
-
-    def clear_all(self) -> None:
-        super().clear_all()
-        self._save()
-
-    def _save(self) -> None:
-        data: dict[str, list[dict[str, str]]] = {}
-        for sid, msgs in self._store.items():
-            data[sid] = [
-                {"type": m.type, "content": m.content if isinstance(m.content, str) else str(m.content)}
-                for m in msgs
-            ]
+    def _persist(self):
+        data = {sid: [{"type": m.type,
+                        "content": m.content if isinstance(m.content, str) else str(m.content)}
+                       for m in msgs]
+                for sid, msgs in self._store.items()}
         tmp = self.path.with_suffix(self.path.suffix + ".tmp")
         try:
             tmp.write_text(json.dumps(data, indent=2))
@@ -110,49 +77,44 @@ class DiskChatMemory(ChatMemory):
         except Exception as exc:
             logger.warning("Failed to persist memory: %s", exc)
 
-    def _load(self) -> None:
+    def _load(self):
         if not self.path.exists():
             return
         try:
             raw = json.loads(self.path.read_text())
-        except Exception as exc:
-            logger.warning("Failed to load memory: %s", exc)
+        except Exception:
             return
         if not isinstance(raw, dict):
             return
-
         for sid, msgs in raw.items():
             if not isinstance(msgs, list):
                 continue
-            restored: list[BaseMessage] = []
+            restored = []
             for item in msgs:
                 if not isinstance(item, dict):
                     continue
                 content = item.get("content", "")
-                msg_type = item.get("type")
-                if msg_type == "human":
+                if item.get("type") == "human":
                     restored.append(HumanMessage(content=content))
-                elif msg_type == "ai":
+                elif item.get("type") == "ai":
                     restored.append(AIMessage(content=content))
             if restored:
                 self._store[sid] = restored[-self.max_messages:]
 
 
-# ── module-level singleton ────────────────────────────────────────────────
+# ── Module singleton ──────────────────────────────────────────────────────────
+
 _memory: Optional[ChatMemory] = None
 
 
 def get_chat_memory() -> ChatMemory:
     global _memory
     if _memory is None:
-        settings = get_settings()
+        s = get_settings()
         base = Path(__file__).resolve().parents[1]
-        path = Path(settings.memory_path)
+        path = Path(s.memory_path)
         if not path.is_absolute():
             path = base / path
-        _memory = DiskChatMemory(
-            path=path,
-            max_messages=settings.memory_max_messages,
-            max_sessions=settings.memory_max_sessions,
-        )
+        _memory = DiskChatMemory(path=path, max_messages=s.memory_max_messages,
+                                 max_sessions=s.memory_max_sessions)
     return _memory
