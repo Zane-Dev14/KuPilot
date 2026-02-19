@@ -1,57 +1,45 @@
-from pydantic_settings import BaseSettings, SettingsConfigDict
-from functools import lru_cache
-import logging
+"""Application settings — loaded from .env via Pydantic BaseSettings."""
 
-logger = logging.getLogger(__name__)
+from functools import lru_cache
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
 
 class Settings(BaseSettings):
-    """Application settings loaded from environment variables."""
-    
-    # Milvus
+    """All tunables live here; every field maps to an env-var."""
+
+    # ── Milvus ────────────────────────────────────────────
     milvus_uri: str = "http://localhost:19530"
-    milvus_token: str = "root:Milvus"
-    milvus_db: str = "default"
     milvus_collection: str = "k8s_failures"
-    
-    # Embeddings
-    embedding_model: str = "BAAI/bge-m3"
-    embedding_dimension: int = 384  # bge-m3 outputs 384-dim
-    embedding_device: str = "cpu"  # "mps" for Apple Silicon
-    
-    # Reranker
+
+    # ── Embeddings ────────────────────────────────────────
+    embedding_model: str = "BAAI/bge-small-en-v1.5"
+    embedding_dimension: int = 384
+    embedding_device: str = "mps"  # "cpu" for non-Apple-Silicon
+
+    # ── Reranker ──────────────────────────────────────────
     reranker_model: str = "BAAI/bge-reranker-v2-m3"
-    reranker_batch_size: int = 128
-    
-    # LLMs
-    simple_model: str = "llama3.1"
+
+    # ── LLMs (Ollama) ────────────────────────────────────
+    simple_model: str = "llama3.1:8b-instruct-q8_0"
     complex_model: str = "deepseek-r1:32b"
     ollama_base_url: str = "http://localhost:11434"
-    
-    # Model Selection
-    query_complexity_threshold: float = 0.7  # Score 0-1
-    
-    # Milvus Index Parameters (HNSW)
-    hnsw_m: int = 16
-    hnsw_ef_construction: int = 256
-    search_ef: int = 128
-    
-    # Document Chunking
+    query_complexity_threshold: float = 0.7
+
+    # ── Chunking / Retrieval ─────────────────────────────
     chunk_size: int = 1000
     chunk_overlap: int = 200
-    
-    # Retrieval
     retrieval_top_k: int = 4
-    retrieval_rerank_k: int = 10  # Retrieve 10, rerank to 4
-    
-    # Logging
+
+    # ── Logging ──────────────────────────────────────────
     log_level: str = "INFO"
-    
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
     )
 
+
 @lru_cache()
 def get_settings() -> Settings:
-    """Get cached settings instance."""
+    """Cached singleton — call freely, always the same object."""
     return Settings()
