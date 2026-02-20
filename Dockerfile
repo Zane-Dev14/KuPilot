@@ -28,6 +28,10 @@ COPY scripts/ scripts/
 COPY static/ static/
 COPY templates/ templates/
 COPY data/ data/
+COPY start.sh start.sh
+
+# Make startup script executable
+RUN chmod +x start.sh
 
 # Persistent volume mount point for Chroma DB + chat memory
 VOLUME ["/data"]
@@ -39,4 +43,4 @@ ENV PYTHONUNBUFFERED=1 \
 
 EXPOSE 8000
 
-CMD ["uvicorn", "src.api:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
+CMD ["./start.sh"]
