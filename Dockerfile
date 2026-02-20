@@ -2,14 +2,25 @@
 FROM python:3.11-slim AS builder
 
 WORKDIR /app
+
+RUN apt-get update && apt-get install -y \
+    build-essential gcc curl \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
 
-# Pre-download the embedding model so container starts instantly
-RUN python -c "from langchain_huggingface import HuggingFaceEmbeddings; \
-    HuggingFaceEmbeddings(model_name='BAAI/bge-small-en-v1.5', \
-    model_kwargs={'device': 'cpu'}, encode_kwargs={'normalize_embeddings': True})"
+RUN pip install --upgrade pip setuptools wheel
 
+RUN pip install --retries 10 --timeout 100 -r requirements.txt
+
+RUN python - <<EOF
+from langchain_huggingface import HuggingFaceEmbeddings
+HuggingFaceEmbeddings(
+    model_name="BAAI/bge-small-en-v1.5",
+    model_kwargs={"device": "cpu"},
+    encode_kwargs={"normalize_embeddings": True}
+)
+EOF
 # ── Stage 2: runtime ─────────────────────────────────────────────────────────
 FROM python:3.11-slim
 
