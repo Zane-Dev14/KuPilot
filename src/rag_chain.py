@@ -129,7 +129,7 @@ _CLASSIFIER_PROMPT = ChatPromptTemplate.from_messages([
     ("system", "You are a router for a Kubernetes diagnosis assistant.\n"
                "Decide: diagnostic | conversational | operational | out_of_scope.\n"
                "Use chat history to interpret short follow-ups.\n"
-               'Return ONLY JSON: {"response_type": "..."}'),
+               'Return ONLY JSON: {{"response_type": "..."}}'),
     ("human", "CHAT HISTORY:\n{history}\n\nUSER QUERY:\n{query}"),
 ])
 
