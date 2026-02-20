@@ -11,7 +11,6 @@ import logging
 import sys
 from pathlib import Path
 
-# Ensure project root is on sys.path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
@@ -20,7 +19,7 @@ from rich.table import Table
 
 from src.config import get_settings
 from src.ingestion import ingest_directory, ingest_file
-from src.vectorstore import MilvusStore
+from src.vectorstore import VectorStore
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -34,7 +33,7 @@ def main() -> None:
     parser.add_argument("--path", type=str, default=str(SAMPLE_DIR),
                         help="File or directory to ingest (default: data/sample/)")
     parser.add_argument("--no-drop", action="store_true",
-                        help="Append to collection instead of wiping it (default: wipe for clean schema)")
+                        help="Append to collection instead of wiping it")
     args = parser.parse_args()
 
     target = Path(args.path)
@@ -44,7 +43,6 @@ def main() -> None:
 
     console.print(f"\n[bold]Ingesting:[/bold] {target}\n")
 
-    # Load documents
     if target.is_dir():
         docs = ingest_directory(target)
     else:
@@ -54,23 +52,20 @@ def main() -> None:
         console.print("[yellow]No documents found.[/yellow]")
         return
 
-    # Store in Milvus
     drop_old = not args.no_drop
-    store = MilvusStore(drop_old=drop_old)
+    store = VectorStore(drop_old=drop_old)
     if args.no_drop:
-        console.print("[yellow]📎 Appending to existing collection[/yellow]")
+        console.print("[yellow]Appending to existing collection[/yellow]")
     else:
-        console.print("[yellow]🗑️  Wiping collection for clean schema[/yellow]")
+        console.print("[yellow]Wiping collection for clean ingest[/yellow]")
     ids = store.add_documents(docs)
 
-    # Summary table
     table = Table(title="Ingestion Summary")
     table.add_column("Metric", style="cyan")
     table.add_column("Value", style="green")
     table.add_row("Chunks created", str(len(docs)))
     table.add_row("Chunks stored", str(len(ids)))
 
-    # Count by doc_type
     types: dict[str, int] = {}
     for d in docs:
         t = d.metadata.get("doc_type", "unknown")
@@ -79,7 +74,7 @@ def main() -> None:
         table.add_row(f"  └ {t}", str(n))
 
     console.print(table)
-    console.print("\n[green]✓ Ingestion complete![/green]\n")
+    console.print("\n[green]Done![/green]\n")
 
 
 if __name__ == "__main__":

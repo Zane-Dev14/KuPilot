@@ -3,7 +3,6 @@
 
 Usage:
     python scripts/chat.py
-    python scripts/chat.py --force-model llama3.1
 
 Commands inside the chat:
     exit   — quit
@@ -19,11 +18,8 @@ sys.path.insert(0, str(ROOT))
 
 from rich.console import Console
 from rich.panel import Panel
-from rich.table import Table
 
 logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
-# Suppress noisy async Milvus warning (we only use sync)
-logging.getLogger("langchain_milvus.vectorstores.milvus").setLevel(logging.ERROR)
 
 console = Console()
 
@@ -39,7 +35,6 @@ def _confidence_colour(c: float) -> str:
 def main() -> None:
     import argparse
     parser = argparse.ArgumentParser(description="K8s Failure Intelligence — interactive chat")
-    parser.add_argument("--force-model", type=str, default=None, help="Override model selection")
     parser.add_argument("--session", type=str, default="cli", help="Session ID for memory")
     args = parser.parse_args()
 
@@ -50,10 +45,9 @@ def main() -> None:
         border_style="cyan",
     ))
 
-    # Lazy imports so startup banner shows immediately
-    from src.rag_chain import RAGChain, estimate_complexity
+    from src.rag_chain import RAGChain
 
-    console.print("\n[dim]Loading models … (first run downloads embeddings + reranker)[/dim]")
+    console.print("\n[dim]Loading models … (first run downloads embeddings)[/dim]")
     chain = RAGChain()
     console.print("[green]Ready![/green]\n")
 
@@ -74,18 +68,13 @@ def main() -> None:
             console.print("[yellow]Memory cleared.[/yellow]\n")
             continue
 
-        # Show complexity score
-        complexity = estimate_complexity(query)
-        console.print(f"[dim]Complexity: {complexity:.2f}[/dim]")
-
         with console.status("[bold green]Thinking …[/bold green]"):
             try:
-                dx = chain.diagnose(query, session_id=args.session, force_model=args.force_model)
+                dx = chain.diagnose(query, session_id=args.session)
             except Exception as exc:
                 console.print(f"[red]Error: {exc}[/red]\n")
                 continue
 
-        # Build output panel
         cc = _confidence_colour(dx.confidence)
         body = (
             f"[bold]Root Cause:[/bold]  {dx.root_cause}\n\n"

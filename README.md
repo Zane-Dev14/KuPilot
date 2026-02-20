@@ -2,7 +2,7 @@
 
 RAG-powered Kubernetes failure diagnosis. Ask questions about pod crashes, OOMKills, scheduling failures — get root-cause analysis backed by your own runbooks, events, and manifests.
 
-![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue) ![macOS](https://img.shields.io/badge/os-macOS-lightgrey) ![Ollama](https://img.shields.io/badge/LLM-Ollama-orange)
+![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue) ![Gemini](https://img.shields.io/badge/LLM-Gemini-blueviolet) ![Chroma](https://img.shields.io/badge/VectorDB-Chroma-orange)
 
 ---
 
@@ -12,33 +12,31 @@ RAG-powered Kubernetes failure diagnosis. Ask questions about pod crashes, OOMKi
 User question
      ↓
 Query Classifier (LLM + heuristics)
-     ├── diagnostic     → RAG pipeline (retrieve → rerank → LLM → structured JSON)
+     ├── diagnostic     → RAG pipeline (retrieve → LLM → structured JSON)
      ├── conversational  → memory lookup ("what did I ask before?")
      ├── operational     → kubectl command suggestions
      └── out_of_scope   → polite refusal
 
 RAG pipeline:
-  1. Milvus vector search (BGE embeddings, 384-dim)
-  2. Cross-encoder reranking (BGE reranker v2)
-  3. Adaptive model: simple queries → llama3.1:8b, complex → Qwen3-coder:30b
-  4. Structured JSON diagnosis with confidence + sources
+  1. Chroma vector search (BGE embeddings, 384-dim)
+  2. Gemini 2.0 Flash generation
+  3. Structured JSON diagnosis with confidence + sources
 ```
 
 ---
 
-## Quick Start
+## Quick Start (Local)
 
 ```bash
 # 1. Clone & enter project
 cd Week-2
 
-# 2. Run setup (starts Milvus, installs deps, runs tests, ingests sample data)
+# 2. Run setup (installs deps, runs tests, downloads embeddings, ingests sample data)
 chmod +x setup.sh
 ./setup.sh
 
-# 3. Start Ollama (separate terminal) & pull models
-ollama serve
-ollama pull llama3.1:8b-instruct-q8_0
+# 3. Set your Google API key
+export GOOGLE_API_KEY=your-key-here   # or add to .env
 
 # 4a. Web UI
 python -m uvicorn src.api:app --reload
@@ -48,7 +46,46 @@ python -m uvicorn src.api:app --reload
 python scripts/chat.py
 ```
 
-> **Milvus broken?** Run `./setup.sh --fix-milvus` — it wipes volumes and rebuilds from scratch.
+---
+
+## Docker
+
+Single container — everything (FastAPI + Chroma + embeddings) runs inside one image.
+
+```bash
+# Build & run
+docker compose up --build
+
+# Or standalone
+docker build -t k8s-copilot .
+docker run -p 8000:8000 -v copilot_data:/data -e GOOGLE_API_KEY=your-key k8s-copilot
+```
+
+The embedded model is pre-downloaded during `docker build`, so startup is instant.
+Chroma data and chat memory persist in the `/data` volume.
+
+---
+
+## Deploy (Render / Fly.io)
+
+### Render (free tier)
+
+1. Push repo to GitHub
+2. Create a **Web Service** on [render.com](https://render.com), connect the repo
+3. Set **Environment** → Docker
+4. Add env var: `GOOGLE_API_KEY`
+5. Add a **Disk** mounted at `/data` (1 GB free)
+6. Deploy — Render builds the Dockerfile automatically
+
+### Fly.io
+
+```bash
+fly launch --no-deploy
+fly secrets set GOOGLE_API_KEY=your-key
+fly volumes create copilot_data --size 1 --region ord
+# Edit fly.toml: [mounts] source="copilot_data" destination="/data"
+fly deploy
+```
 
 ---
 
@@ -57,11 +94,11 @@ python scripts/chat.py
 ```
 src/
   config.py          Settings (Pydantic BaseSettings, reads .env)
-  vectorstore.py     Embeddings + reranker + Milvus wrapper
+  vectorstore.py     Embeddings + Chroma wrapper
   ingestion.py       File loaders (YAML, JSON events, Markdown, logs) + chunking
   memory.py          Per-session chat memory (LRU eviction, disk persistence)
-  rag_chain.py       Core RAG: classify → retrieve → rerank → generate → parse
-  api.py             FastAPI server (web UI + REST + SSE streaming)
+  rag_chain.py       Core RAG: classify → retrieve → generate → parse
+  api.py             FastAPI server (web UI + REST + SSE streaming + CORS)
 
 scripts/
   chat.py            Interactive CLI chat (rich output)
@@ -70,7 +107,7 @@ scripts/
 static/              Frontend assets (Three.js cinematic UI)
 templates/           Jinja2 HTML template
 data/sample/         Sample K8s manifests, events, runbooks
-tests/               Offline unit tests (no Milvus/Ollama needed)
+tests/               Offline unit tests (no external services needed)
 ```
 
 ---
@@ -80,11 +117,10 @@ tests/               Offline unit tests (no Milvus/Ollama needed)
 | Method | Endpoint | What it does |
 |--------|----------|-------------|
 | `GET`  | `/` | Web UI |
-| `GET`  | `/health` | Milvus connection status |
+| `GET`  | `/health` | Chroma connection status |
 | `POST` | `/diagnose` | Diagnose a failure → structured JSON |
 | `POST` | `/diagnose/stream` | Same, but SSE token streaming |
-| `POST` | `/query-analysis` | Debug: complexity score + model pick |
-| `POST` | `/ingest` | Ingest documents into Milvus |
+| `POST` | `/ingest` | Ingest documents into Chroma |
 | `POST` | `/memory/clear` | Clear a session's memory |
 
 **Example — diagnose:**
@@ -95,19 +131,6 @@ curl -X POST http://localhost:8000/diagnose \
   -d '{"question": "Why is my pod OOMKilled?", "session_id": "user1"}'
 ```
 
-```json
-{
-  "diagnosis": {
-    "root_cause": "Container exceeded 512Mi memory limit",
-    "explanation": "The data-processor pod allocated more than its limit...",
-    "recommended_fix": "1. Increase limit to 1Gi  2. Profile memory usage",
-    "confidence": 0.85,
-    "sources": ["data/sample/docs/oomkilled-runbook.md"]
-  },
-  "complexity_score": 0.35
-}
-```
-
 ---
 
 ## Configuration
@@ -116,34 +139,34 @@ All settings via environment variables or `.env` file:
 
 | Variable | Default | What |
 |----------|---------|------|
-| `MILVUS_URI` | `http://localhost:19530` | Milvus connection |
+| `GOOGLE_API_KEY` | *(required)* | Gemini API key |
+| `MODEL_NAME` | `gemini-2.0-flash` | Gemini model name |
+| `CHROMA_PERSIST_DIR` | `/data/chroma` | Chroma storage path |
+| `CHROMA_COLLECTION` | `k8s_failures` | Chroma collection name |
 | `EMBEDDING_MODEL` | `BAAI/bge-small-en-v1.5` | Embedding model (384-dim) |
-| `EMBEDDING_DEVICE` | `mps` | `mps` for Apple Silicon, `cpu` otherwise |
-| `SIMPLE_MODEL` | `llama3.1:8b-instruct-q8_0` | Fast model for simple queries |
-| `COMPLEX_MODEL` | `Qwen3-coder:30b` | Large model for complex reasoning |
-| `QUERY_COMPLEXITY_THRESHOLD` | `0.7` | Score above → complex model |
-| `RETRIEVAL_TOP_K` | `4` | Docs returned after reranking |
+| `EMBEDDING_DEVICE` | `cpu` | `mps` for Apple Silicon, `cpu` for Docker |
+| `RETRIEVAL_TOP_K` | `4` | Documents returned per query |
 | `CHUNK_SIZE` | `1000` | Text chunk size for ingestion |
+| `MEMORY_PATH` | `/data/chat_memory.json` | Chat history file |
 
 ---
 
 ## Requirements
 
-- **macOS** with Docker Desktop
 - **Python 3.10+**
-- **Ollama** ([ollama.ai](https://ollama.ai)) for local LLM inference
-- ~8 GB RAM for embeddings + Milvus + small model
+- **Google Gemini API key** (free tier or paid)
+- ~512 MB RAM for embeddings + Chroma
 
 ---
 
 ## Tests
 
 ```bash
-# Offline tests — no Milvus or Ollama needed
+# Offline tests — no Gemini or Chroma server needed
 pytest tests/test_basic.py -v
 ```
 
-Covers: config defaults, memory (LRU, eviction, persistence), model selector (complexity scoring), JSON parser, ingestion (all file types), query classifier, conversational handler.
+Covers: config defaults, memory (LRU, eviction, persistence), JSON parser, ingestion (all file types), query classifier, conversational handler.
 
 ---
 

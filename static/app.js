@@ -376,7 +376,7 @@ class ChatUI {
     this.sendBtn = document.getElementById('send-btn');
     this.clearBtn = document.getElementById('clear-btn');
     this.sessionEl = document.getElementById('session-id');
-    this.modelEl = document.getElementById('model-override');
+    this.modelEl = null;
     this.welcomeEl = document.getElementById('welcome-screen');
 
     this.isStreaming = false;
@@ -623,8 +623,7 @@ class ChatUI {
     this._showTyping();
 
     const sessionId = this.sessionEl?.value?.trim() || 'web';
-    const forceModel = this.modelEl?.value || null;
-    const payload = { question, session_id: sessionId, force_model: forceModel };
+    const payload = { question, session_id: sessionId };
 
     let rawText = '';
     let isJsonStream = false;
@@ -634,7 +633,7 @@ class ChatUI {
     let bubble = null;
 
     try {
-      const res = await fetch('/diagnose/stream', {
+      const res = await fetch(`${API_BASE_URL}/diagnose/stream`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
@@ -749,7 +748,7 @@ class ChatUI {
 
   async _fallbackDiagnose(question, payload) {
     try {
-      const res = await fetch('/diagnose', {
+      const res = await fetch(`${API_BASE_URL}/diagnose`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
@@ -889,7 +888,7 @@ class ChatUI {
   async _clearMemory() {
     const sessionId = this.sessionEl?.value?.trim() || 'web';
     try {
-      await fetch('/memory/clear', {
+      await fetch(`${API_BASE_URL}/memory/clear`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ session_id: sessionId }),
@@ -1021,7 +1020,7 @@ const App = {
     const dot = document.getElementById('status-dot');
     const text = document.getElementById('status-text');
     try {
-      const res = await fetch('/health');
+      const res = await fetch(`${API_BASE_URL}/health`);
       const data = await res.json();
       if (res.ok && data.status === 'ok') {
         dot?.classList.remove('error');

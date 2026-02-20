@@ -1,12 +1,11 @@
-"""Embeddings, Milvus vector store, and cross-encoder reranker."""
+"""Embeddings and Chroma vector store."""
 
 import logging
 from functools import lru_cache
 
 from langchain_core.documents import Document
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_milvus import Milvus
-from sentence_transformers import CrossEncoder
+from langchain_chroma import Chroma
 
 from src.config import get_settings
 
@@ -20,47 +19,43 @@ def get_embeddings() -> HuggingFaceEmbeddings:
     return HuggingFaceEmbeddings(
         model_name=s.embedding_model,
         model_kwargs={"device": s.embedding_device},
-        encode_kwargs={"normalize_embeddings": True})
+        encode_kwargs={"normalize_embeddings": True},
+    )
 
 
-@lru_cache(maxsize=1)
-def get_reranker() -> CrossEncoder:
-    s = get_settings()
-    logger.info("Loading reranker: %s", s.reranker_model)
-    return CrossEncoder(s.reranker_model)
+class VectorStore:
+    """Thin wrapper around Chroma with persistent storage."""
 
-
-def rerank(docs: list[Document], query: str, top_k: int = 4) -> list[Document]:
-    if not docs:
-        return []
-    scores = get_reranker().predict([[query, d.page_content] for d in docs])
-    return [d for d, _ in sorted(zip(docs, scores), key=lambda x: x[1], reverse=True)[:top_k]]
-
-
-class MilvusStore:
-    def __init__(self, drop_old=False):
+    def __init__(self, drop_old: bool = False):
         self._settings = get_settings()
         self._drop_old = drop_old
-        self._vs = None
+        self._vs: Chroma | None = None
 
-    def _get_vs(self):
+    def _get_vs(self) -> Chroma:
         if self._vs is None:
             s = self._settings
-            self._vs = Milvus(
+            if self._drop_old:
+                import chromadb
+                client = chromadb.PersistentClient(path=s.chroma_persist_dir)
+                try:
+                    client.delete_collection(s.chroma_collection)
+                    logger.info("Dropped existing collection '%s'", s.chroma_collection)
+                except ValueError:
+                    pass
+            self._vs = Chroma(
+                collection_name=s.chroma_collection,
                 embedding_function=get_embeddings(),
-                collection_name=s.milvus_collection,
-                connection_args={"uri": s.milvus_uri},
-                drop_old=self._drop_old, auto_id=True)
+                persist_directory=s.chroma_persist_dir,
+            )
         return self._vs
 
     def add_documents(self, docs: list[Document]) -> list[str]:
-        logger.info("Storing %d chunks", len(docs))
+        logger.info("Storing %d chunks in Chroma", len(docs))
         return self._get_vs().add_documents(docs)
 
     def search(self, query: str, k: int | None = None) -> list[Document]:
         k = k or self._settings.retrieval_top_k
-        docs = self._get_vs().similarity_search(query, k=min(k * 3, 20))
-        return rerank(docs, query, top_k=k)
+        return self._get_vs().similarity_search(query, k=k)
 
     def health_check(self) -> bool:
         try:

@@ -25,7 +25,7 @@ def _splitter():
 
 
 def _stamp(docs):
-    """Normalize metadata keys (Milvus requires uniform schemas)."""
+    """Normalize metadata keys to a canonical set."""
     now = datetime.now(timezone.utc).isoformat()
     canonical = ("source", "doc_type", "kind", "name", "namespace", "reason")
     allowed = set(canonical) | {"ingested_at", "chunk_index"}
@@ -139,11 +139,11 @@ def ingest_file(path: Path) -> list[Document]:
     return _stamp(docs)
 
 
-def ingest_directory(directory: Path) -> list[Document]:
+def ingest_directory(path: Path) -> list[Document]:
     """Recursively ingest all supported files under directory."""
     all_docs = []
     for ext in _LOADERS:
-        for fp in sorted(directory.rglob(f"*{ext}")):
+        for fp in sorted(path.rglob(f"*{ext}")):
             logger.info("Ingesting %s", fp)
             all_docs.extend(ingest_file(fp))
     return all_docs  # ingest_file already stamps — no double-stamp

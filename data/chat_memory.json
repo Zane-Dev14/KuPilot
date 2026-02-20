@@ -89,6 +89,14 @@
     {
       "type": "ai",
       "content": "Root Cause: Your name is George\nExplanation: You mentioned your name earlier in our conversation."
+    },
+    {
+      "type": "human",
+      "content": "Why is my pod in CrashLoopBackOff?"
+    },
+    {
+      "type": "ai",
+      "content": "Root Cause: Container restarts due to crashes\nExplanation: The pod is stuck in CrashLoopBackOff state because one or more containers within the pod are crashing and restarting. This can be caused by a variety of issues such as incorrect configuration, resource constraints, or application errors. Check the container logs for error messages that may indicate the root cause.\nRecommended Fix: Run `kubectl describe pod <pod_name>` to view the pod's events and check for any error messages. Then, run `kubectl logs <pod_name> -c <container_name>` to view the container logs."
     }
   ]
 }

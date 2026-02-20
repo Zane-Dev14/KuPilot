@@ -1,6 +1,6 @@
-"""Tests that run without Milvus, Ollama, or downloaded models.
+"""Tests that run without external services (Chroma, Gemini).
 
-Covers: config defaults, memory, model selector, ingestion parsing.
+Covers: config defaults, memory, ingestion parsing, query classifier, conversational handler.
 Run:  pytest tests/test_basic.py -v
 """
 
@@ -17,11 +17,11 @@ class TestConfig:
     def test_defaults(self):
         from src.config import Settings
         s = Settings()  # no .env needed — uses defaults
-        assert s.milvus_uri == "http://localhost:19530"
-        assert s.milvus_collection == "k8s_failures"
+        assert s.chroma_persist_dir == "/data/chroma"
+        assert s.chroma_collection == "k8s_failures"
         assert s.embedding_dimension == 384
         assert s.retrieval_top_k == 4
-        assert 0.0 < s.query_complexity_threshold < 1.0
+        assert s.model_name == "gemini-2.0-flash"
 
     def test_singleton(self):
         from src.config import get_settings
@@ -77,56 +77,6 @@ class TestMemory:
         mem.add_user_message("b", "x")
         mem.clear_all()
         assert mem.active_sessions == 0
-
-
-# ─── Model selector ─────────────────────────────────────────────────────────
-
-class TestModelSelector:
-    def test_simple_query_low_complexity(self):
-        from src.rag_chain import estimate_complexity
-        score = estimate_complexity("list pods")
-        assert score < 0.2, f"Expected < 0.2, got {score}"
-
-    def test_definition_query_low(self):
-        from src.rag_chain import estimate_complexity
-        score = estimate_complexity("What is CrashLoopBackOff?")
-        assert score < 0.5, f"Expected < 0.5, got {score}"
-
-    def test_reasoning_query(self):
-        from src.rag_chain import estimate_complexity
-        score = estimate_complexity("Why is my pod in CrashLoopBackOff?")
-        assert score >= 0.3, f"Expected >= 0.3, got {score}"
-
-    def test_complex_multi_question(self):
-        from src.rag_chain import estimate_complexity
-        score = estimate_complexity("Why is it crashing? How do I fix it? What caused the OOM?")
-        assert score >= 0.5, f"Expected >= 0.5, got {score}"
-
-    def test_compound_query_high(self):
-        from src.rag_chain import estimate_complexity
-        score = estimate_complexity(
-            "Why is my pod crashing with CrashLoopBackOff AND how do I troubleshoot it?"
-        )
-        assert score >= 0.5, f"Expected >= 0.5, got {score}"
-
-    def test_multi_signal_reaches_threshold(self):
-        from src.rag_chain import estimate_complexity
-        score = estimate_complexity(
-            "Why is my pod OOMKilled even though memory limit is 512Mi? "
-            "How do I diagnose and fix this intermittent issue?"
-        )
-        assert score >= 0.7, f"Expected >= 0.7, got {score}"
-
-    def test_word_boundary_no_false_positive(self):
-        from src.rag_chain import estimate_complexity
-        # 'show' should NOT match 'how', 'shower' should NOT match 'how'
-        score = estimate_complexity("show me the pods")
-        assert score < 0.2, f"Expected < 0.2, got {score}"
-
-    def test_force_model_override(self):
-        from src.rag_chain import select_model
-        result = select_model("hi", force="my-custom-model")
-        assert result == "my-custom-model"
 
 
 # ─── JSON parser ─────────────────────────────────────────────────────────────
@@ -269,9 +219,9 @@ class TestQueryClassifier:
 class TestAnswerConversational:
     """Tests _answer_conversational() with hand-crafted message history.
 
-    No Milvus or Ollama calls — KB fallback is only triggered when no session
+    No external service calls — KB fallback is only triggered when no session
     mentions exist, and since we mock history with mentions, that path is not
-    exercised here (it requires Milvus to be up).
+    exercised here (it requires a running vector store).
     """
 
     def _make_history(self, pairs):
@@ -308,7 +258,7 @@ class TestAnswerConversational:
         history = self._make_history([
             ("human", "What is a Pod?"),
         ])
-        # MilvusStore will fail here (no server); the function must not raise
+        # VectorStore may fail here (no persistent dir); the function must not raise
         root, explanation, conf, sources, evidence = self._call(
             "Have i asked you about CrashLoopBackOff?", history
         )

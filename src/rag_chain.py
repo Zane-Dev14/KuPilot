@@ -1,4 +1,4 @@
-"""RAG diagnosis chain — retrieval + adaptive model selection + generation."""
+"""RAG diagnosis chain — retrieval + Groq generation."""
 
 import json, logging, os, re
 from typing import Optional
@@ -6,12 +6,11 @@ from typing import Optional
 from langchain_core.documents import Document
 from langchain_core.messages import BaseMessage
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_ollama import ChatOllama
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from src.config import get_settings
 from src.memory import get_chat_memory
-from src.vectorstore import MilvusStore
+from src.vectorstore import VectorStore
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +18,8 @@ logger = logging.getLogger(__name__)
 # ── Output schema ─────────────────────────────────────────────────────────────
 
 class FailureDiagnosis(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
+
     root_cause: str = Field(default="Unknown")
     explanation: str = Field(default="")
     recommended_fix: str = Field(default="")
@@ -29,25 +30,23 @@ class FailureDiagnosis(BaseModel):
     model_used: Optional[str] = None
 
 
-# ── Keyword lists ─────────────────────────────────────────────────────────────
+# ── Keyword lists (used by heuristic classifier) ─────────────────────────────
 
-_REASONING_KW = ["why", "explain", "diagnose", "troubleshoot", "root cause",
-                 "how", "analyze", "investigate", "debug", "cause"]
-_UNCERTAIN_KW = ["maybe", "could", "might", "possibly", "not sure",
-                 "intermittent", "sometimes", "random"]
-_COMPOUND_KW  = ["and", "but", "also", "plus", "additionally", "as well",
-                 "however", "although", "even though", "while"]
-_TECHNICAL_KW = ["oomkilled", "oom", "crashloopbackoff", "crashloop",
-                 "imagepullbackoff", "imagepull", "failedscheduling",
-                 "evicted", "cordon", "taint", "affinity", "pdb",
-                 "hpa", "vpa", "resource quota", "limitrange",
-                 "network policy", "init container", "sidecar",
-                 "liveness", "readiness", "startup probe",
-                 "persistent volume", "configmap", "secret"]
-_K8S_TERMS = ["k8s", "kubernetes", "pod", "pods", "deployment", "replicaset",
-              "statefulset", "daemonset", "namespace", "node", "cluster",
-              "crashloop", "oomkilled", "imagepull", "ingress", "service",
-              "configmap", "secret", "pvc", "pv", "kube-system", "k3d"]
+_TECHNICAL_KW = [
+    "oomkilled", "oom", "crashloopbackoff", "crashloop",
+    "imagepullbackoff", "imagepull", "failedscheduling",
+    "evicted", "cordon", "taint", "affinity", "pdb",
+    "hpa", "vpa", "resource quota", "limitrange",
+    "network policy", "init container", "sidecar",
+    "liveness", "readiness", "startup probe",
+    "persistent volume", "configmap", "secret",
+]
+_K8S_TERMS = [
+    "k8s", "kubernetes", "pod", "pods", "deployment", "replicaset",
+    "statefulset", "daemonset", "namespace", "node", "cluster",
+    "crashloop", "oomkilled", "imagepull", "ingress", "service",
+    "configmap", "secret", "pvc", "pv", "kube-system", "k3d",
+]
 _CONVERSATION_PATTERNS = [
     r"\bfirst (question|message)\b", r"\bwhat did i ask\b",
     r"\bwhat was my (first|last|previous) question\b",
@@ -61,9 +60,6 @@ _OPERATIONAL_PATTERNS = [
 
 
 # ── Small helpers ─────────────────────────────────────────────────────────────
-
-def _word_in(word, text):
-    return bool(re.search(r'\b' + re.escape(word) + r'\b', text))
 
 def _term_in(term, text):
     return bool(re.search(r'(?<!\w)' + re.escape(term) + r'(?!\w)', text))
@@ -79,41 +75,22 @@ def _clean_source(s):
     return s[idx:] if idx != -1 else s
 
 def _build_evidence(docs, n=3):
-    return [f"{_clean_source(d.metadata.get('source', '?'))}: "
-            f"{d.page_content.strip().replace(chr(10), ' ')[:220]}"
-            for d in docs[:n]]
+    return [
+        f"{_clean_source(d.metadata.get('source', '?'))}: "
+        f"{d.page_content.strip().replace(chr(10), ' ')[:220]}"
+        for d in docs[:n]
+    ]
 
 
-# ── Complexity & model selection ──────────────────────────────────────────────
-
-def estimate_complexity(query: str) -> float:
-    q = query.lower()
-    score = min(sum(1 for kw in _REASONING_KW if _word_in(kw, q)) * 0.20, 0.50)
-    if any(_word_in(kw, q) for kw in _UNCERTAIN_KW):
-        score += 0.15
-    qmarks = q.count("?")
-    if qmarks > 1:
-        score += min(qmarks * 0.10, 0.30)
-    compound = sum(1 for kw in _COMPOUND_KW if _word_in(kw, q))
-    if compound:
-        score += min(compound * 0.10, 0.20)
-    score += min(sum(1 for kw in _TECHNICAL_KW if kw in q) * 0.10, 0.30)
-    words = len(query.split())
-    if words > 15:
-        score += 0.10
-    if words > 30:
-        score += 0.10
-    return round(min(score, 1.0), 2)
-
-
-def select_model(query: str, force: str | None = None) -> str:
-    if force:
-        return force
+def _get_llm():
+    """Single LLM instance — Groq."""
     s = get_settings()
-    c = estimate_complexity(query)
-    model = s.complex_model if c >= s.query_complexity_threshold else s.simple_model
-    logger.info("Complexity %.2f -> %s", c, model)
-    return model
+    from langchain_groq import ChatGroq
+    return ChatGroq(
+        model=s.model_name,
+        groq_api_key=s.groq_api_key,
+        temperature=0,
+    )
 
 
 # ── Prompts ───────────────────────────────────────────────────────────────────
@@ -170,8 +147,9 @@ def _format_docs(docs):
 def _format_history(messages):
     if not messages:
         return "(no previous conversation)"
-    return "\n".join(f"{'User' if m.type == 'human' else 'AI'}: {m.content[:500]}"
-                     for m in messages[-10:])
+    return "\n".join(
+        f"{'User' if m.type == 'human' else 'AI'}: {m.content[:500]}"
+        for m in messages[-10:])
 
 def _format_memory_text(dx):
     parts = [f"Root Cause: {dx.root_cause}"]
@@ -191,8 +169,7 @@ def _classify_query(query, history=None):
     # LLM classification (skip during pytest)
     if "PYTEST_CURRENT_TEST" not in os.environ:
         try:
-            s = get_settings()
-            llm = ChatOllama(model=s.simple_model, temperature=0, base_url=s.ollama_base_url)
+            llm = _get_llm()
             raw = (_CLASSIFIER_PROMPT | llm).invoke(
                 {"history": _format_history(history), "query": query})
             raw = raw.content if hasattr(raw, "content") else str(raw)
@@ -244,9 +221,7 @@ def _answer_conversational(query, history, store=None):
     if history is None:
         history = []
     user_msgs = _user_messages(history)
-    logger.debug("_answer_conversational: q=%s user_msgs=%d", q, len(user_msgs))
 
-    # First / last question
     if re.search(r"\bfirst (question|message)\b", q):
         if user_msgs:
             return f"Your first question was: {user_msgs[0]}", "", 0.9, [], []
@@ -257,22 +232,17 @@ def _answer_conversational(query, history, store=None):
             return f"Your last question was: {user_msgs[-1]}", "", 0.9, [], []
         return "I do not have any prior questions in this session.", "", 0.3, [], []
 
-    # "Have I asked about <topic>?"
-    logger.debug("_answer_conversational: checking 'have I asked' pattern")
     m = re.search(
         r"(?:have i|did i)\s+(?:ask(?:ed)?|mention(?:ed)?|talk(?:ed)?\s+about|"
         r"bring\s+up|discuss(?:ed)?)\s+(?:you\s+)?(?:about\s+)?(.+)", q)
-    logger.debug("_answer_conversational: have_i_match=%s", bool(m))
     if m:
         topic = m.group(1).strip("?.! ")
         topic = topic.split("?")[0].strip()
         topic = re.sub(r"\b(today|now|recently|where|when|what|how)\b", "", topic)
         topic = re.split(r"\s+(?:and|or|but|nor)\b", topic)[0]
         topic = re.sub(r"[?.!,]+", "", topic).strip()
-        logger.debug("_answer_conversational: extracted topic='%s'", topic)
 
         mentions = _find_mentions(history, topic)
-        logger.debug("_answer_conversational: mentions_found=%d", len(mentions))
         if mentions:
             if "where" in q:
                 return "Yes — mentioned in session.", "; ".join(mentions[:5]), 0.9, [], mentions
@@ -281,8 +251,7 @@ def _answer_conversational(query, history, store=None):
         # KB fallback
         docs = []
         try:
-            logger.debug("_answer_conversational: KB search for '%s'", topic)
-            docs = (store if store is not None else MilvusStore()).search(topic)
+            docs = (store if store is not None else VectorStore()).search(topic)
         except Exception:
             pass
 
@@ -293,6 +262,23 @@ def _answer_conversational(query, history, store=None):
                     "See evidence and sources.", 0.7, sources, evidence)
 
         return f"No, I don't see any prior mentions of {topic} in this session.", "", 0.6, [], []
+
+    # Default: use LLM to answer from conversation history
+    if history:
+        try:
+            llm = _get_llm()
+            history_text = _format_history(history)
+            prompt = f"""Based on our conversation history, answer this question: {query}
+
+Conversation history:
+{history_text}
+
+Provide a brief, direct answer. If the info isn't in the history, say so."""
+            response = llm.invoke(prompt)
+            answer = response.content if hasattr(response, 'content') else str(response)
+            return answer.strip(), "Based on our conversation history", 0.85, [], []
+        except Exception:
+            pass
 
     return "I can answer questions about our conversation in this session.", "", 0.4, [], []
 
@@ -330,7 +316,6 @@ def _parse_json(text: str) -> dict:
 # ── Shared builders ───────────────────────────────────────────────────────────
 
 def _build_non_diagnostic(response_type, query, history, store):
-    """Build FailureDiagnosis for non-diagnostic query types."""
     if response_type == "conversational":
         root, expl, conf, sources, evidence = _answer_conversational(query, history, store)
         return FailureDiagnosis(root_cause=root, explanation=expl, recommended_fix="N/A",
@@ -346,7 +331,6 @@ def _build_non_diagnostic(response_type, query, history, store):
 
 
 def _parse_llm_diagnosis(raw_text, docs, model_name, response_type):
-    """Parse LLM output + docs into FailureDiagnosis."""
     parsed = _parse_json(str(raw_text))
     try:
         conf = max(0.0, min(1.0, float(parsed.get("confidence") or 0.5)))
@@ -366,14 +350,14 @@ def _parse_llm_diagnosis(raw_text, docs, model_name, response_type):
 
 class RAGChain:
     def __init__(self):
-        self.store = MilvusStore()
+        self.store = VectorStore()
         self.memory = get_chat_memory()
 
     def _save_turn(self, sid, query, dx):
         self.memory.add_user_message(sid, query)
         self.memory.add_ai_message(sid, _format_memory_text(dx)[:1200])
 
-    def diagnose(self, query, session_id="default", force_model=None):
+    def diagnose(self, query, session_id="default"):
         history = self.memory.get_history(session_id)
         rtype = _classify_query(query, history)
 
@@ -384,24 +368,22 @@ class RAGChain:
 
         docs = self.store.search(query)
         logger.info("Retrieved %d docs for query", len(docs))
-        model_name = select_model(query, force_model)
-        llm = ChatOllama(model=model_name, temperature=0,
-                         base_url=get_settings().ollama_base_url)
+        s = get_settings()
+        llm = _get_llm()
         result = (_PROMPT | llm).invoke({
             "context": _format_docs(docs),
             "history": _format_history(history), "query": query})
         raw_text = result.content if hasattr(result, "content") else str(result)
 
-        dx = _parse_llm_diagnosis(raw_text, docs, model_name, rtype)
+        dx = _parse_llm_diagnosis(raw_text, docs, s.model_name, rtype)
         self._save_turn(session_id, query, dx)
         return dx
 
-    async def diagnose_stream(self, query, session_id="default", force_model=None):
+    async def diagnose_stream(self, query, session_id="default"):
         import asyncio
         history = self.memory.get_history(session_id)
         rtype = _classify_query(query, history)
 
-        # Non-diagnostic: yield complete answer at once
         if rtype != "diagnostic":
             dx = _build_non_diagnostic(rtype, query, history, self.store)
             self._save_turn(session_id, query, dx)
@@ -412,12 +394,10 @@ class RAGChain:
             yield f"data: {json.dumps({'done': True, 'diagnosis': dx.model_dump()})}\n\n"
             return
 
-        # Diagnostic: stream LLM tokens
         docs = await asyncio.to_thread(self.store.search, query)
         logger.info("Retrieved %d docs for streaming query", len(docs))
-        model_name = select_model(query, force_model)
-        llm = ChatOllama(model=model_name, temperature=0,
-                         base_url=get_settings().ollama_base_url)
+        s = get_settings()
+        llm = _get_llm()
         raw_text = ""
         async for chunk in (_PROMPT | llm).astream({
             "context": _format_docs(docs),
@@ -427,6 +407,6 @@ class RAGChain:
                 raw_text += str(token)
                 yield f"data: {json.dumps({'token': token})}\n\n"
 
-        dx = _parse_llm_diagnosis(raw_text, docs, model_name, rtype)
+        dx = _parse_llm_diagnosis(raw_text, docs, s.model_name, rtype)
         self._save_turn(session_id, query, dx)
         yield f"data: {json.dumps({'done': True, 'diagnosis': dx.model_dump()})}\n\n"
