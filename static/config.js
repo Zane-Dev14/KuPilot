@@ -3,4 +3,4 @@
 // For production (GitHub Pages): set to your Render backend URL
 const API_BASE_URL = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
   ? ''  // Local: use same origin
-  : 'https://your-app-name.onrender.com';  // Production: replace with your Render URL
+  : 'https://kupilot.onrender.com';  // Production: Render backend
