@@ -40,7 +40,7 @@ class VectorStore:
                 try:
                     client.delete_collection(s.chroma_collection)
                     logger.info("Dropped existing collection '%s'", s.chroma_collection)
-                except ValueError:
+                except (ValueError, chromadb.errors.NotFoundError):
                     pass
             self._vs = Chroma(
                 collection_name=s.chroma_collection,
